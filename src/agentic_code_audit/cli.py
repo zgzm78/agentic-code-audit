@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 from .config import Settings
@@ -16,8 +15,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    audit = subparsers.add_parser("audit", help="Audit a local source code directory.")
-    audit.add_argument("target", help="Local project directory to audit.")
+    audit = subparsers.add_parser("audit", help="Audit a local directory or Git/GitHub repository.")
+    audit.add_argument("target", help="Local project directory, GitHub URL, Git URL, or owner/repo.")
     audit.add_argument(
         "-o",
         "--output",
@@ -30,9 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory used to load .env. Defaults to current working directory.",
     )
     audit.add_argument(
-        "--no-llm",
-        action="store_true",
-        help="Disable DeepSeek analysis for this run even when DEEPSEEK_API_KEY is configured.",
+        "--runtime-url",
+        default="",
+        help="Optional running target base URL for HTTP dynamic probes, e.g. http://127.0.0.1:5000.",
     )
     return parser
 
@@ -42,16 +41,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "audit":
-        target = Path(args.target)
-        if not target.exists() or not target.is_dir():
-            print(f"Target directory does not exist: {target}", file=sys.stderr)
-            return 2
-
         settings = Settings.load(Path(args.project_dir))
-        if args.no_llm:
-            settings = replace(settings, deepseek_api_key="")
+        if not settings.deepseek_api_key:
+            print("DEEPSEEK_API_KEY is required. DeepSeek is mandatory for audit tasks.", file=sys.stderr)
+            return 2
         pipeline = AuditPipeline(settings)
-        artifacts = pipeline.run(target, Path(args.output))
+        try:
+            artifacts = pipeline.run(args.target, Path(args.output), runtime_url=args.runtime_url)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         print(f"JSON report: {artifacts.json_path}")
         print(f"Markdown report: {artifacts.markdown_path}")
         print(f"Findings: {len(artifacts.report.findings)}")

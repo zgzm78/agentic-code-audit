@@ -37,7 +37,7 @@ RULES = [
         severity="critical",
         title="Possible command injection",
         regex=re.compile(
-            r"(os\.(system|popen)|subprocess\.(popen|call|run)|exec\(|shell_exec|system\(|child_process\.(exec|spawn))",
+            r"(os\.(system|popen)\s*\(|subprocess\.(popen|call|run)\s*\(|\bexec\(|shell_exec\(|(?<!\.)\bsystem\(|std::system\(|(?<!\.)\bpopen\(|child_process\.(exec|spawn)\s*\()",
             re.IGNORECASE,
         ),
         sink_hint="Command execution",
@@ -48,7 +48,7 @@ RULES = [
         severity="high",
         title="Possible path traversal",
         regex=re.compile(
-            r"\b(open|readfile|send_file|send_from_directory|fs\.readFile|FileInputStream)\s*\([^)]*((request|req\.|param|query|args|GET|POST)|(\+|format\(|f[\"']))",
+            r"\b(open|readfile|send_file|send_from_directory|fs\.readFile|FileInputStream)\s*\([^)]*((request|req\.|param|query|args|GET|POST)|([\"'][^\"']*[\"']\s*\+\s*[A-Za-z_])|([A-Za-z_][A-Za-z0-9_.]*\s*\+\s*[\"']))",
             re.IGNORECASE,
         ),
         sink_hint="File access",
@@ -64,6 +64,22 @@ RULES = [
         ),
         sink_hint="Secret literal",
         recommendation="Move secrets to environment variables or a secret manager.",
+    ),
+    PatternRule(
+        vulnerability_type="unsafe_c_string_api",
+        severity="medium",
+        title="Possible unsafe C/C++ string API",
+        regex=re.compile(r"\b(strcpy|strcat|sprintf|vsprintf|gets)\s*\(", re.IGNORECASE),
+        sink_hint="Unsafe C/C++ string operation",
+        recommendation="Use bounded APIs and validate destination buffer sizes.",
+    ),
+    PatternRule(
+        vulnerability_type="unsafe_memory_copy",
+        severity="medium",
+        title="Possible unsafe memory copy",
+        regex=re.compile(r"\b(memcpy|memmove|std::memcpy|std::memmove)\s*\(", re.IGNORECASE),
+        sink_hint="Memory copy operation",
+        recommendation="Validate source length, destination size, and integer arithmetic before copying.",
     ),
 ]
 
@@ -98,6 +114,8 @@ class BuiltinPatternScanner:
         findings: list[Finding] = []
         rel = normalize_path(path, root)
         for line_no, line in enumerate(text.splitlines(), start=1):
+            if self._is_comment_only(line):
+                continue
             for rule in RULES:
                 if not rule.regex.search(line):
                     continue
@@ -129,6 +147,10 @@ class BuiltinPatternScanner:
                     )
                 )
         return findings
+
+    def _is_comment_only(self, line: str) -> bool:
+        stripped = line.strip()
+        return stripped.startswith(("#", "//", "/*", "*", "*/"))
 
     def _finding_id(self, rel: str, line_no: int, vuln_type: str, line: str) -> str:
         digest = hashlib.sha1(f"{rel}:{line_no}:{vuln_type}:{line}".encode("utf-8")).hexdigest()

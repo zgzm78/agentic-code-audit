@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .agents.recon import ReconAgent
 from .config import Settings
+from .inputs import TargetResolver
 from .pipeline import AuditPipeline
 
 
@@ -16,16 +18,13 @@ mcp = FastMCP("agentic-code-audit")
 
 
 @mcp.tool()
-def audit_local_path(target: str, output: str = "reports/mcp") -> dict:
-    """Audit a local source-code directory and return report paths plus finding count."""
-    target_path = Path(target).resolve()
-    if not target_path.exists() or not target_path.is_dir():
-        raise ValueError(f"Target directory does not exist: {target_path}")
-
+def audit_target(target: str, output: str = "reports/mcp", runtime_url: str = "") -> dict:
+    """Audit a local path or Git/GitHub repository and return report paths plus finding count."""
     settings = Settings.load(Path.cwd())
-    artifacts = AuditPipeline(settings).run(target_path, Path(output))
+    artifacts = AuditPipeline(settings).run(target, Path(output), runtime_url=runtime_url)
     return {
-        "target": str(target_path),
+        "target": artifacts.report.target,
+        "input_kind": artifacts.report.input_source.kind,
         "json_report": str(artifacts.json_path),
         "markdown_report": str(artifacts.markdown_path),
         "findings": len(artifacts.report.findings),
@@ -34,14 +33,11 @@ def audit_local_path(target: str, output: str = "reports/mcp") -> dict:
 
 
 @mcp.tool()
-def profile_local_path(target: str) -> dict:
-    """Profile a local source-code directory without running vulnerability analysis."""
-    target_path = Path(target).resolve()
-    if not target_path.exists() or not target_path.is_dir():
-        raise ValueError(f"Target directory does not exist: {target_path}")
-
+def profile_target(target: str) -> dict:
+    """Profile a local path or Git/GitHub repository without running vulnerability analysis."""
     settings = Settings.load(Path.cwd())
-    profile = AuditPipeline(settings).profiler.profile(target_path)
+    input_source = TargetResolver(Path.cwd() / "runs").resolve(target)
+    profile, _ = ReconAgent(settings).run(Path(input_source.local_path))
     return profile.__dict__
 
 

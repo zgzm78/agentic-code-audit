@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from ..llm import DeepSeekClient
-from ..models import Finding, ProjectProfile, ToolResult
+from ..models import Finding, ProjectProfile, SemanticIndex, ToolResult
 from ..tools.builtin_patterns import BuiltinPatternScanner
 
 
@@ -22,10 +23,13 @@ class AnalysisAgent:
         target: Path,
         profile: ProjectProfile,
         tool_results: list[ToolResult],
+        semantic_index: SemanticIndex | None = None,
     ) -> list[Finding]:
         findings = self.pattern_scanner.scan(target)
         findings.extend(self._extract_external_findings(tool_results))
         findings = self._deduplicate(findings)
+        if semantic_index:
+            self._enrich_with_context(target, findings, semantic_index)
 
         if self.llm_client.enabled and findings:
             self._add_llm_triage(target, profile, findings[:20])
@@ -166,6 +170,107 @@ class AnalysisAgent:
         for finding in findings:
             finding.evidence.append("DeepSeek triage executed; see run metadata for raw response.")
             finding.confidence = min(0.95, finding.confidence + 0.05)
+
+    def _enrich_with_context(
+        self,
+        target: Path,
+        findings: list[Finding],
+        semantic_index: SemanticIndex,
+    ) -> None:
+        routes_by_file = {}
+        for route in semantic_index.routes:
+            routes_by_file.setdefault(route.file_path, []).append(route)
+
+        for finding in findings:
+            file_path = target / finding.file_path
+            context = self._read_context(file_path, finding.line_start or 1)
+            source_name, source_expr = self._infer_source(context, finding.code_snippet)
+            route = self._nearest_route(routes_by_file.get(finding.file_path, []), finding.line_start)
+
+            if source_expr and (not finding.source or finding.source == "unknown"):
+                finding.source = source_expr
+            if route:
+                finding.route = f"{route.method} {route.route}"
+                finding.call_chain = [finding.route, route.handler, finding.sink or "security sink"]
+                finding.evidence.append(f"Nearest route: {finding.route} -> {route.handler}")
+            elif not finding.call_chain:
+                finding.call_chain = [finding.file_path, finding.sink or "security sink"]
+
+            if source_name:
+                finding.evidence.append(f"Likely tainted variable: {source_name}")
+                finding.confidence = min(0.9, finding.confidence + 0.15)
+
+            finding.exploit_payloads = self._payloads_for(finding)
+            finding.exploit_chain = self._exploit_chain_for(finding)
+            finding.cwe, finding.owasp = self._taxonomy(finding.vulnerability_type)
+
+    def _read_context(self, file_path: Path, line_start: int) -> list[tuple[int, str]]:
+        try:
+            lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            return []
+        start = max(1, line_start - 8)
+        end = min(len(lines), line_start + 3)
+        return [(idx, lines[idx - 1]) for idx in range(start, end + 1)]
+
+    def _infer_source(self, context: list[tuple[int, str]], snippet: str) -> tuple[str, str]:
+        assignments: dict[str, str] = {}
+        for _, line in context:
+            match = re.search(
+                r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(request\.(args|form|json|values|GET|POST).*|req\.(query|body|params).*)",
+                line,
+            )
+            if match:
+                assignments[match.group(1)] = match.group(2).strip()
+        for name, expr in assignments.items():
+            if name in snippet or any(name in line for _, line in context[-3:]):
+                return name, expr
+        if re.search(r"request\.|req\.|\$_GET|\$_POST|input\(", snippet):
+            return "inline_user_input", "inline request input"
+        return "", ""
+
+    def _nearest_route(self, routes: list[Any], line: int | None):
+        if not routes:
+            return None
+        if not line:
+            return routes[-1]
+        before = [route for route in routes if route.line_start <= line]
+        return before[-1] if before else None
+
+    def _payloads_for(self, finding: Finding) -> list[str]:
+        payloads = {
+            "sql_injection": ["' OR '1'='1", "1 UNION SELECT NULL", "1; SELECT sqlite_version();--"],
+            "command_injection": ["127.0.0.1; id", "127.0.0.1 && whoami", "$(id)"],
+            "path_traversal": ["../../../../etc/passwd", "..\\..\\..\\Windows\\win.ini"],
+            "hardcoded_secret": ["rotate-secret", "secret-scan-confirmation"],
+        }
+        return payloads.get(finding.vulnerability_type, ["manual-validation-payload"])
+
+    def _exploit_chain_for(self, finding: Finding) -> list[str]:
+        if finding.vulnerability_type == "hardcoded_secret":
+            return [
+                "secret literal exists in source code",
+                "repository access exposes the credential material",
+                "impact: credential disclosure or credential reuse risk",
+            ]
+        chain = ["attacker controls input"]
+        if finding.route:
+            chain.append(f"send payload to {finding.route}")
+        if finding.source:
+            chain.append(f"input reaches source {finding.source}")
+        if finding.sink:
+            chain.append(f"tainted data reaches sink {finding.sink}")
+        chain.append(f"impact: {finding.vulnerability_type}")
+        return chain
+
+    def _taxonomy(self, vuln_type: str) -> tuple[str, str]:
+        mapping = {
+            "sql_injection": ("CWE-89", "A03:2021-Injection"),
+            "command_injection": ("CWE-78", "A03:2021-Injection"),
+            "path_traversal": ("CWE-22", "A01:2021-Broken Access Control"),
+            "hardcoded_secret": ("CWE-798", "A07:2021-Identification and Authentication Failures"),
+        }
+        return mapping.get(vuln_type, ("", ""))
 
     def _deduplicate(self, findings: list[Finding]) -> list[Finding]:
         seen: set[tuple[str, int | None, str]] = set()

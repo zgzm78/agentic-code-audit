@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any, Callable
 
 from ..config import Settings
 from ..models import ToolResult, utc_now
@@ -12,9 +14,11 @@ from ..models import ToolResult, utc_now
 class CommandRunner:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.env = self._build_env()
 
     def run_json_tool(self, tool: str, command: list[str], cwd: Path) -> ToolResult:
-        if not shutil.which(command[0]):
+        executable = shutil.which(command[0], path=self.env.get("PATH"))
+        if not executable:
             return ToolResult(
                 tool=tool,
                 status="skipped",
@@ -24,13 +28,17 @@ class CommandRunner:
             )
 
         try:
+            resolved_command = [executable, *command[1:]]
             proc = subprocess.run(
-                command,
+                resolved_command,
                 cwd=str(cwd),
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 timeout=self.settings.tool_timeout,
                 check=False,
+                env=self.env,
             )
         except subprocess.TimeoutExpired:
             return ToolResult(
@@ -61,23 +69,76 @@ class CommandRunner:
         except json.JSONDecodeError:
             return None
 
+    def _build_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        app_root = Path.cwd()
+        local_paths = [
+            app_root / ".tools" / "bin",
+            app_root / ".tools" / "semgrep-venv" / "Scripts",
+        ]
+        existing = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join([str(path) for path in local_paths if path.exists()] + [existing])
+        for key, env_names in {
+            "http.proxy": ("HTTP_PROXY", "http_proxy"),
+            "https.proxy": ("HTTPS_PROXY", "https_proxy"),
+        }.items():
+            proxy = self._read_git_config(key)
+            if proxy:
+                for env_name in env_names:
+                    env.setdefault(env_name, proxy)
+        return env
+
+    def _read_git_config(self, key: str) -> str:
+        try:
+            proc = subprocess.run(
+                ["git", "config", "--get", key],
+                cwd=str(Path.cwd()),
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
 
 class SecurityToolRunner:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        event_sink: Callable[[str, str, str, dict[str, Any]], None] | None = None,
+    ):
         self.command_runner = CommandRunner(settings)
+        self.event_sink = event_sink
 
     def run_all(self, target: Path) -> list[ToolResult]:
         target = target.resolve()
         results = [
-            self.run_semgrep(target),
-            self.run_gitleaks(target),
-            self.run_osv_scanner(target),
+            self._run_tool("semgrep", "Semgrep 静态规则扫描开始", lambda: self.run_semgrep(target)),
+            self._run_tool("gitleaks", "Gitleaks 凭据泄露扫描开始", lambda: self.run_gitleaks(target)),
+            self._run_tool("osv-scanner", "OSV 依赖漏洞扫描开始", lambda: self.run_osv_scanner(target)),
         ]
         if self._has_python_project(target):
-            results.append(self.run_bandit(target))
+            results.append(self._run_tool("bandit", "Bandit Python 安全扫描开始", lambda: self.run_bandit(target)))
         if (target / "package.json").exists():
-            results.append(self.run_npm_audit(target))
+            results.append(self._run_tool("npm-audit", "npm audit 依赖扫描开始", lambda: self.run_npm_audit(target)))
         return results
+
+    def _run_tool(self, tool: str, start_message: str, fn) -> ToolResult:
+        self._emit("ToolAgent", "tool_start", start_message, {"tool": tool})
+        result = fn()
+        self._emit(
+            "ToolAgent",
+            "tool_end",
+            f"{tool} 完成: {result.status}; {result.summary}",
+            {"tool": tool, "status": result.status, "summary": result.summary, "command": result.command},
+        )
+        return result
+
+    def _emit(self, agent: str, event_type: str, message: str, metadata: dict[str, Any]) -> None:
+        if self.event_sink:
+            self.event_sink(agent, event_type, message, metadata)
 
     def run_semgrep(self, target: Path) -> ToolResult:
         return self.command_runner.run_json_tool(
@@ -96,7 +157,16 @@ class SecurityToolRunner:
     def run_osv_scanner(self, target: Path) -> ToolResult:
         return self.command_runner.run_json_tool(
             "osv-scanner",
-            ["osv-scanner", "--format", "json", "--recursive", str(target)],
+            [
+                "osv-scanner",
+                "scan",
+                "source",
+                "--format",
+                "json",
+                "--recursive",
+                "--allow-no-lockfiles",
+                str(target),
+            ],
             target,
         )
 

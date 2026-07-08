@@ -1,0 +1,45 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentic-code-audit-backend:local
+    command: ["agentic-code-audit-backend"]
+    ports:
+      - "8000:8000"
+    environment:
+      AUDIT_TOOL_TIMEOUT: "180"
+      AUDIT_SANDBOX_CONTAINER: "agentic-code-audit-sandbox"
+      DEEPSEEK_MODEL: "deepseek-v4-pro"
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./runs:/app/runs
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - sandbox
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: agentic-code-audit-frontend:local
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_BASE_URL: ""
+    depends_on:
+      - backend
+
+  sandbox:
+    container_name: agentic-code-audit-sandbox
+    build:
+      context: .
+      dockerfile: docker/sandbox/Dockerfile
+    image: agentic-code-audit-sandbox:local
+    network_mode: "none"
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./runs:/workspace/runs
+      - ./reports:/workspace/reports

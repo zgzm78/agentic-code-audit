@@ -20,8 +20,8 @@ python -m agentic_code_audit.mcp_server
 
 暴露工具：
 
-- `audit_local_path(target, output)`：审计本地源码目录，输出报告路径和漏洞数量。
-- `profile_local_path(target)`：仅执行项目画像。
+- `audit_target(target, output, runtime_url)`：审计本地路径或 Git/GitHub 仓库，输出报告路径和漏洞数量。
+- `profile_target(target)`：仅执行项目画像。
 
 设计原则：
 

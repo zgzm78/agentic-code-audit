@@ -1,82 +1,136 @@
 # agentic-code-audit
 
-基于大模型智能体的开源项目源码安全缺陷自动审计与验证系统。
+DeepAudit 风格的多 Agent 源码安全审计平台，用 DeepSeek 驱动“危险函数定位 -> 切片分析 -> 候选漏洞生成 -> 线索汇聚 -> 漏洞类型判定 -> 沙箱验证 -> 报告”的完整链路。
 
-本项目参考 DeepAudit 的 `Orchestrator + Recon + Analysis + Verification + Tools`
-思路，并结合源码分析场景重新设计了审计流水线：
+当前版本采用轻量全栈架构：
 
 ```text
-项目输入 -> 项目画像 -> 源码语义建模 -> 工具扫描 -> LLM 语义审计
-       -> 候选漏洞归并 -> 静态/动态验证 -> 报告与证据链输出
+React/Vite frontend
+  -> FastAPI backend + SSE
+  -> OrchestratorAgent
+  -> Recon / Tool / DangerousFunction / Slice / Candidate / Aggregator / Classifier / Verification / Report
+  -> SQLite + artifacts
+  -> Docker sandbox
 ```
 
-当前版本是一个可运行 MVP：
+## 当前功能
 
-- 支持本地源码目录审计。
-- 支持项目语言、框架、依赖文件、入口点和高风险文件识别。
-- 内置规则覆盖 SQL 注入、命令注入、路径遍历、硬编码密钥。
-- 自动尝试调用 Semgrep、Gitleaks、OSV-Scanner、Bandit、npm audit。
-- 支持 DeepSeek API 增强分析，但没有 API Key 时也能离线运行。
-- 输出 JSON 和 Markdown 审计报告。
-- `.env` 已被 `.gitignore` 忽略，避免 API Key 泄露到 GitHub。
+- 支持本地目录、Git URL、GitHub URL、`owner/repo` 输入。
+- DeepSeek 必选，默认模型为 `deepseek-v4-pro`。
+- 工具链支持 Semgrep、Bandit、Gitleaks、OSV-Scanner、npm audit 和内置危险函数规则。
+- 漏洞挖掘按阶段输出危险函数、程序切片、候选漏洞、最终 finding。
+- 验证阶段参考 DeepAudit 和 AnyPoC：由 LLM 设计 harness/PoC，在 Docker sandbox 中执行，并保存命令、退出码、stdout、stderr、脚本和生成文件。
+- 前端提供任务创建、Agent 树、SSE 实时日志、finding 详情、链路图、验证证据和报告预览。
+- `.env` 已加入 `.gitignore`，真实 API Key 不应提交到 GitHub。
 
 ## 快速开始
 
 ```powershell
 cd C:\Users\fujs\Desktop\security-agent\agentic-code-audit
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e .
-```
-
-配置 DeepSeek：
-
-```powershell
 Copy-Item .env.example .env
 notepad .env
 ```
 
-在 `.env` 中填写：
+`.env` 至少需要：
 
 ```env
-DEEPSEEK_API_KEY=你的 DeepSeek API Key
+DEEPSEEK_API_KEY=your-deepseek-api-key
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_MODEL=deepseek-v4-pro
 ```
 
-运行一次审计：
+### Docker 一键启动
 
 ```powershell
+docker compose up --build
+```
+
+打开：
+
+- Frontend: `http://127.0.0.1:3000`
+- Backend health: `http://127.0.0.1:8000/api/health`
+
+### 本地 CLI 运行
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e .
 agentic-code-audit audit .\examples\vulnerable-python -o reports\demo
 ```
 
-离线运行，不调用 DeepSeek：
+审计 GitHub 仓库：
 
 ```powershell
-agentic-code-audit audit .\examples\vulnerable-python -o reports\demo --no-llm
+agentic-code-audit audit https://github.com/Exiv2/exiv2.git -o reports\exiv2
 ```
 
-或者不安装包，直接用源码方式运行：
+C/C++ 项目由系统自动判断是否需要 CMake + ASAN/UBSAN 构建：
 
 ```powershell
-$env:PYTHONPATH="src"
-python -m agentic_code_audit audit .\examples\vulnerable-python -o reports\demo
+agentic-code-audit audit https://github.com/Exiv2/exiv2.git -o reports\exiv2
 ```
 
-输出文件：
+带运行目标 URL 做 HTTP 动态验证：
 
-- `reports/demo/audit-report.json`
-- `reports/demo/audit-report.md`
+```powershell
+agentic-code-audit audit .\examples\vulnerable-python -o reports\demo --runtime-url http://127.0.0.1:5000
+```
+
+## 安装本地安全工具
+
+工具可以安装到仓库内 `.tools/`，不会污染系统 PATH：
+
+```powershell
+.\scripts\install_tools.ps1 -Proxy http://127.0.0.1:18081
+```
+
+安装后路径会被程序自动加入执行环境：
+
+- Semgrep: `.tools\semgrep-venv\Scripts\semgrep.exe`
+- Bandit: `.tools\semgrep-venv\Scripts\bandit.exe`
+- Gitleaks: `.tools\bin\gitleaks.exe`
+- OSV-Scanner: `.tools\bin\osv-scanner.exe`
+
+## API
+
+- `POST /api/tasks`: 创建审计任务。
+- `GET /api/tasks`: 任务列表。
+- `GET /api/tasks/{task_id}`: 任务详情。
+- `GET /api/tasks/{task_id}/events`: SSE 实时事件流。
+- `GET /api/tasks/{task_id}/findings`: finding 列表。
+- `GET /api/tasks/{task_id}/findings/{finding_id}`: finding 详情、链路图、PoC、验证证据。
+- `GET /api/tasks/{task_id}/report.md`: Markdown 报告。
+- `GET /api/artifacts/{artifact_id}`: 下载 artifact。
+
+## 输出
+
+审计完成后会生成：
+
+- `audit-report.json`
+- `audit-report.md`
+- `pocs/<finding-id>/bug_report.md`
+- `pocs/<finding-id>/runbook.md`
+- `pocs/<finding-id>/verification.json`
+- sandbox 执行日志和 LLM 生成的 harness 脚本
+
+## 测试
+
+```powershell
+python -m pytest tests
+cd frontend
+npm.cmd install
+npm.cmd run build
+```
 
 ## 文档
 
 - [系统架构](docs/ARCHITECTURE.md)
+- [DeepAudit 对比与重构说明](docs/DEEPAUDIT_COMPARISON.md)
 - [使用说明](docs/USAGE.md)
-- [开发说明](docs/DEVELOPMENT.md)
+- [Web 界面](docs/WEB.md)
 - [MCP 接入](docs/MCP.md)
-- [路线图](docs/ROADMAP.md)
-- [Agent Skill 模板](skills/source-code-audit/SKILL.md)
 
 ## 安全说明
 
-本系统只应用于授权代码仓库和本地测试环境。动态验证和 PoC 执行必须在容器或隔离沙箱中进行。
+本系统仅用于授权项目、课程实验和本地安全研究。PoC、harness 和动态验证必须在隔离环境中执行，不要对未授权目标运行利用代码。
