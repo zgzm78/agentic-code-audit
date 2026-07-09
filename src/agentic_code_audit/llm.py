@@ -16,22 +16,22 @@ class LLMResponse:
 
 
 class DeepSeekClient:
-    """Minimal DeepSeek OpenAI-compatible chat client using stdlib only."""
+    """Minimal OpenAI-compatible chat client. DeepSeek is the default provider."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
 
     @property
     def enabled(self) -> bool:
-        return bool(self.settings.deepseek_api_key)
+        return bool(self.settings.llm_api_key)
 
     def chat(self, system_prompt: str, user_prompt: str, timeout: int = 60) -> LLMResponse:
         if not self.enabled:
-            return LLMResponse(ok=False, content="", error="DEEPSEEK_API_KEY is not configured")
+            return LLMResponse(ok=False, content="", error="LLM API key is not configured")
 
-        url = self.settings.deepseek_base_url.rstrip("/") + "/chat/completions"
+        url = self.settings.llm_base_url.rstrip("/") + "/chat/completions"
         payload = {
-            "model": self.settings.deepseek_model,
+            "model": self.settings.llm_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -44,7 +44,7 @@ class DeepSeekClient:
             data=data,
             method="POST",
             headers={
-                "Authorization": f"Bearer {self.settings.deepseek_api_key}",
+                "Authorization": f"Bearer {self.settings.llm_api_key}",
                 "Content-Type": "application/json",
             },
         )

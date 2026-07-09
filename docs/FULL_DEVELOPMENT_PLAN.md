@@ -185,6 +185,16 @@
 
 项目目录下保留 `tools/` 或 `.tools/` 作为可选本地工具目录；Docker 镜像中安装稳定工具；找不到工具时记录 `tool_unavailable`，不能静默跳过。
 
+阶段二必须完成核心工具安装闭环，而不是只写 registry：
+
+- 更新 `scripts/install_tools.ps1`，安装/检查 `rg`、`semgrep`、`gitleaks`、`osv-scanner`、`bandit`；`npm audit` 依赖 Node/npm，脚本中只做版本检查。
+- 更新 `docker/sandbox/Dockerfile`，安装/检查 `ripgrep`、`semgrep`、`gitleaks`、`osv-scanner`、`bandit`、Node/npm。
+- 更新 `ToolRegistry`，将上述工具标为阶段二核心工具，其中 `rg`、`semgrep`、`gitleaks`、`osv-scanner` 为 required，语言专项工具按项目语言推荐。
+- 更新 `ToolParsers`，确保 Semgrep/Gitleaks/OSV/Bandit/npm audit 输出可结构化解析。
+- 增加测试：核心工具可用性检测、工具缺失状态、parser、cache、artifact 保存。
+
+阶段二不安装 `CodeQL`、`Joern`、`AFL++`、`libFuzzer` 这类重型工具，只在 registry 中保留 optional 检测项。
+
 ### 2.4 完成标准
 
 - Recon、Mining、Verification 都通过 ToolModule 调工具。
@@ -220,6 +230,15 @@ LLM 使用方式：
 - 对 Exiv2 能识别为 C++ 项目，识别 CMake/配置文件/CLI 目标。
 - 对 Python/JS 示例项目能识别测试入口和 Web/CLI 入口。
 - 前端能看到项目画像和后续计划。
+
+### 3.4 阶段三工具补充
+
+阶段三以项目画像为主，不强制安装重型分析工具，但必须为下一阶段漏洞挖掘准备静态工具接入点：
+
+- `ToolRegistry` 增加/确认 `cppcheck`、`clang-tidy`、`pip-audit`、`gosec`、`cargo-audit`、`CodeQL`、`Joern` 的 optional 状态和能力标签。
+- `scripts/install_tools.ps1` 可以先安装轻量工具：`cppcheck`、`pip-audit`、`cargo-audit`；`clang-tidy` 依赖 LLVM，可先做检测和安装说明。
+- `docker/sandbox/Dockerfile` 可安装轻量工具和运行时依赖，但 `CodeQL`、`Joern` 仍建议 optional。
+- Recon 的 `recommended_tools` 必须根据语言输出这些工具是否建议使用，以及当前是否 available。
 
 ## 4. 阶段四：VulnerabilityMiningAgent
 
@@ -294,6 +313,14 @@ C/C++ 额外尝试：
 - cppcheck。
 - clang-tidy。
 - CodeQL 或 Joern，若可用。
+
+阶段四引入的工具必须同步完成安装/检测闭环：
+
+- 更新 `scripts/install_tools.ps1`：补 `cppcheck`、`pip-audit`、`cargo-audit`、`gosec` 的安装或清晰安装提示；`clang-tidy` 优先检测 LLVM 安装状态。
+- 更新 `docker/sandbox/Dockerfile`：补 `cppcheck`、`clang-tidy`、`pip-audit`、Go/Rust 基础工具中可稳定安装的部分。
+- `CodeQL`、`Joern` 在阶段四先作为 optional；只有实现对应 query/CPG 调用、缓存和资源限制后，才改为推荐安装。
+- 更新 `ToolParsers`：cppcheck XML/文本、pip-audit JSON、cargo-audit JSON、gosec JSON。
+- 缺失 optional 工具时不能阻塞挖掘，但 finding/candidate 要记录该工具未运行的原因。
 
 #### 4.2.3 排序
 
@@ -487,6 +514,14 @@ RuntimeManager 的职责不是只判断“能不能构建”，而是根据 find
 - curl、httpie/httpx、sqlite3、常见数据库 client。
 - Semgrep、Gitleaks、OSV、Bandit、cppcheck 等基础安全工具。
 
+阶段五必须补齐动态验证和利用所需运行环境工具：
+
+- 更新 `docker/sandbox/Dockerfile`：安装 `cmake`、`ninja`、`make`、`gcc/g++`、`clang/clang++`、ASAN/UBSAN/LSAN 支持、`valgrind`、`gdb/lldb`、`curl`、`sqlite3`、常见数据库 client、Python/Node/Go/Rust/Java/PHP 基础运行时。
+- 更新 `scripts/install_tools.ps1`：Windows 本机至少检测上述工具；能稳定安装的工具可自动安装，复杂工具给出明确安装提示和版本检测。
+- 更新 `ToolRegistry`：将运行环境工具纳入 `environment` / `verification` capability，不再只登记漏洞扫描工具。
+- 更新 `EnvironmentManager`：根据 Recon 输出选择需要的运行时、构建工具、mock 工具和数据库 client。
+- 更新 `SandboxExecutor`：执行前记录工具版本，缺失时返回 `blocked` 并保存缺失工具列表和安装建议。
+
 环境准备流程：
 
 1. 根据 Recon 结果选择 runtime profile。
@@ -576,17 +611,7 @@ Checker 应规则化实现，不依赖 LLM 自述：
 
 LLM 可以辅助解释证据，但最终状态必须由 checker 依据真实证据给出。
 
-### 5.7 ExploitAgent
 
-ExploitAgent 不应只复述验证结果，应生成可运行 PoC：
-
-- `poc.py`、`poc.sh`、`payload.bin`、`request.http` 等。
-- `README_REPRO.md` 说明复现步骤。
-- 链路图 JSON。
-- 复现命令。
-- 预期输出。
-
-PoC 生成后必须再次在沙箱里跑一次，保存回放证据。
 
 ## 6. 阶段六：报告与 UI
 

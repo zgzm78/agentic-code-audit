@@ -1,0 +1,10 @@
+{
+  "patterns": [
+    "argv",
+    "argc",
+    "stdin",
+    "recv\\s*\\(",
+    "fread\\s*\\(",
+    "getenv\\s*\\("
+  ]
+}

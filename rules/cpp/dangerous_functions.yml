@@ -1,0 +1,11 @@
+{
+  "rules": [
+    {"pattern": "\\bstrcpy\\s*\\(", "api": "strcpy", "vuln_type": "unsafe_c_string_api", "category": "memory", "confidence": 0.84},
+    {"pattern": "\\bstrcat\\s*\\(", "api": "strcat", "vuln_type": "unsafe_c_string_api", "category": "memory", "confidence": 0.8},
+    {"pattern": "\\bsprintf\\s*\\(", "api": "sprintf", "vuln_type": "unsafe_c_string_api", "category": "memory", "confidence": 0.78},
+    {"pattern": "\\bgets\\s*\\(", "api": "gets", "vuln_type": "unsafe_c_string_api", "category": "memory", "confidence": 0.9},
+    {"pattern": "\\bmemcpy\\s*\\(", "api": "memcpy", "vuln_type": "unsafe_memory_copy", "category": "memory", "confidence": 0.66},
+    {"pattern": "\\bsystem\\s*\\(", "api": "system", "vuln_type": "command_injection", "category": "command", "confidence": 0.78},
+    {"pattern": "\\bpopen\\s*\\(", "api": "popen", "vuln_type": "command_injection", "category": "command", "confidence": 0.74}
+  ]
+}

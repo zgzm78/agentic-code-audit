@@ -28,6 +28,9 @@ def audit_target(target: str, output: str = "reports/mcp", runtime_url: str = ""
         "json_report": str(artifacts.json_path),
         "markdown_report": str(artifacts.markdown_path),
         "findings": len(artifacts.report.findings),
+        "llm_enabled": artifacts.report.llm_enabled,
+        "llm_provider": artifacts.report.llm_provider,
+        "llm_model": artifacts.report.llm_model,
         "deepseek_enabled": artifacts.report.llm_enabled,
     }
 

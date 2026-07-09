@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 from .config import Settings
 from .pipeline import AuditPipeline
 from .store import AuditStore
+from .tools.runner import ToolRunner
 
 
 APP_ROOT = Path.cwd()
@@ -48,24 +50,34 @@ def health() -> dict[str, Any]:
     settings = Settings.load(APP_ROOT)
     return {
         "status": "ok",
+        "llm_configured": bool(settings.llm_api_key),
+        "llm_provider": settings.llm_provider,
         "deepseek_configured": bool(settings.deepseek_api_key),
-        "model": settings.deepseek_model,
+        "model": settings.llm_model,
         "native_build_policy": "auto",
         "db": str(STORE.db_path),
     }
 
 
+@app.get("/api/tools")
+def list_tools() -> list[dict[str, Any]]:
+    settings = Settings.load(APP_ROOT)
+    runner = ToolRunner(settings)
+    return [asdict(item) for item in runner.list_tools()]
+
+
 @app.post("/api/tasks")
 def create_task(payload: TaskCreate) -> dict[str, Any]:
     settings = Settings.load(APP_ROOT)
-    if not settings.deepseek_api_key:
-        raise HTTPException(status_code=400, detail="DEEPSEEK_API_KEY is required.")
+    if not settings.llm_api_key:
+        raise HTTPException(status_code=400, detail="LLM API key is required.")
     task_id = STORE.create_task(
         payload.target,
         payload.mode,
-        settings.deepseek_model,
+        settings.llm_model,
         payload.runtime_url,
         False,
+        llm_provider=settings.llm_provider,
     )
     return {"task_id": task_id, "status": "queued"}
 
@@ -77,8 +89,8 @@ def start_task(task_id: str, background_tasks: BackgroundTasks) -> dict[str, Any
         raise HTTPException(status_code=404, detail="task not found")
     if task["status"] == "running":
         raise HTTPException(status_code=409, detail="task is already running")
-    if task["status"] == "completed":
-        raise HTTPException(status_code=409, detail="completed task cannot be restarted")
+    if task["status"] in {"completed", "failed", "cancelled"}:
+        raise HTTPException(status_code=409, detail=f"{task['status']} task cannot be restarted")
     payload = {
         "target": task["target"],
         "mode": task["mode"],
@@ -95,14 +107,27 @@ def cancel_task(task_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="task not found")
     if task["status"] in {"completed", "failed", "cancelled"}:
         return {"task_id": task_id, "status": task["status"]}
-    STORE.update_task(task_id, status="cancelled", error="用户停止任务", finished_at=_now())
-    STORE.add_event(task_id, "System", "task_cancelled", "用户已停止任务")
+    STORE.mark_cancelled(task_id)
+    STORE.add_event(task_id, "System", "task_cancelled", "用户已停止任务", phase="cancelled")
     return {"task_id": task_id, "status": "cancelled"}
 
 
 @app.get("/api/tasks")
 def list_tasks() -> list[dict[str, Any]]:
     return STORE.list_tasks()
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: str) -> dict[str, Any]:
+    task = STORE.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task["status"] == "running":
+        raise HTTPException(status_code=409, detail="running task must be cancelled before deletion")
+    deleted = STORE.delete_task(task_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="task not found")
+    return {"task_id": task_id, "deleted": True}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -149,6 +174,16 @@ def list_findings(task_id: str) -> list[dict[str, Any]]:
     return STORE.list_findings(task_id)
 
 
+@app.get("/api/tasks/{task_id}/profile")
+def get_profile(task_id: str) -> dict[str, Any]:
+    if not STORE.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    profile = STORE.get_project_profile(task_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="profile not found")
+    return profile
+
+
 @app.get("/api/tasks/{task_id}/findings/{finding_id}")
 def get_finding(task_id: str, finding_id: str) -> dict[str, Any]:
     finding = STORE.get_finding(task_id, finding_id)
@@ -166,6 +201,17 @@ def get_report(task_id: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="report file not found")
     return PlainTextResponse(path.read_text(encoding="utf-8"))
+
+
+@app.get("/api/tasks/{task_id}/report.json")
+def get_json_report(task_id: str):
+    task = STORE.get_task(task_id)
+    if not task or not task.get("json_report"):
+        raise HTTPException(status_code=404, detail="report not found")
+    path = Path(task["json_report"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="report file not found")
+    return FileResponse(path, media_type="application/json", filename="audit-report.json")
 
 
 @app.get("/api/artifacts/{artifact_id}")
@@ -188,12 +234,20 @@ def _run_task(task_id: str, payload: dict[str, Any]) -> None:
     current = STORE.get_task(task_id)
     if current and current["status"] == "cancelled":
         return
-    STORE.update_task(task_id, status="running", started_at=_now())
-    STORE.add_event(task_id, "Orchestrator", "task_started", "审计任务开始", payload)
+    if not STORE.mark_running(task_id, "Orchestrator", "task_started"):
+        return
+    STORE.add_event(task_id, "Orchestrator", "task_started", "审计任务开始", payload, phase="task_started")
     try:
         settings = Settings.load(APP_ROOT)
         output_dir = REPORTS_DIR / task_id
-        STORE.add_event(task_id, "InputAgent", "progress", "解析目标并准备工作区")
+        STORE.add_event(
+            task_id,
+            "InputAgent",
+            "progress",
+            "解析目标并准备工作区",
+            {"progress_done": 0, "progress_total": 8},
+            phase="resolve_target",
+        )
 
         def event_sink(agent: str, event_type: str, message: str, metadata: dict[str, Any]) -> None:
             task = STORE.get_task(task_id)
@@ -209,10 +263,17 @@ def _run_task(task_id: str, payload: dict[str, Any]) -> None:
         for finding in artifacts.report.findings:
             STORE.add_event(
                 task_id,
-                "VulnerabilityClassifier",
+                "VulnerabilityMiningAgent",
                 "finding",
                 finding.title,
-                {"id": finding.id, "severity": finding.severity, "type": finding.vulnerability_type},
+                {
+                    "id": finding.id,
+                    "severity": finding.severity,
+                    "type": finding.vulnerability_type,
+                    "evidence_strength": finding.evidence_strength,
+                    "should_verify": finding.should_verify,
+                },
+                phase="finding",
             )
         for verification in artifacts.report.verification_results:
             STORE.add_event(
@@ -221,17 +282,25 @@ def _run_task(task_id: str, payload: dict[str, Any]) -> None:
                 "verification",
                 f"{verification.finding_id}: {verification.status}",
                 {"finding_id": verification.finding_id, "status": verification.status},
+                phase="verification",
             )
         STORE.save_report(task_id, artifacts.report, artifacts.json_path, artifacts.markdown_path)
-        STORE.update_task(task_id, status="completed", finished_at=_now())
-        STORE.add_event(task_id, "ReportAgent", "report", "报告已生成", {"report": str(artifacts.markdown_path)})
-        STORE.add_event(task_id, "System", "task_completed", "审计任务完成")
+        STORE.add_event(
+            task_id,
+            "ReportAgent",
+            "report",
+            "报告已生成",
+            {"report": str(artifacts.markdown_path), "progress_done": 8, "progress_total": 8},
+            phase="report",
+        )
+        STORE.mark_completed(task_id)
+        STORE.add_event(task_id, "System", "task_completed", "审计任务完成", phase="completed")
     except TaskCancelled:
-        STORE.update_task(task_id, status="cancelled", error="用户停止任务", finished_at=_now())
-        STORE.add_event(task_id, "System", "task_cancelled", "用户已停止任务")
+        STORE.mark_cancelled(task_id)
+        STORE.add_event(task_id, "System", "task_cancelled", "用户已停止任务", phase="cancelled")
     except Exception as exc:  # noqa: BLE001
-        STORE.update_task(task_id, status="failed", error=str(exc), finished_at=_now())
-        STORE.add_event(task_id, "System", "error", f"任务失败: {exc}", {"error": str(exc)})
+        STORE.mark_failed(task_id, str(exc))
+        STORE.add_event(task_id, "System", "error", f"任务失败: {exc}", {"error": str(exc)}, phase="failed")
 
 def _now() -> str:
     from .models import utc_now

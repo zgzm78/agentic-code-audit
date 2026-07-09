@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-https://mirrors.ustc.edu.cn/debian}
+        APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR:-https://mirrors.ustc.edu.cn/debian-security}
     image: agentic-code-audit-backend:local
     command: ["agentic-code-audit-backend"]
     ports:
@@ -37,6 +40,9 @@ services:
     build:
       context: .
       dockerfile: docker/sandbox/Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-https://mirrors.ustc.edu.cn/debian}
+        APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR:-https://mirrors.ustc.edu.cn/debian-security}
     image: agentic-code-audit-sandbox:local
     network_mode: "none"
     command: ["sleep", "infinity"]

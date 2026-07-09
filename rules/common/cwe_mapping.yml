@@ -1,0 +1,11 @@
+{
+  "command_injection": "CWE-78",
+  "sql_injection": "CWE-89",
+  "path_traversal": "CWE-22",
+  "unsafe_memory_copy": "CWE-787",
+  "unsafe_c_string_api": "CWE-120",
+  "code_execution": "CWE-94",
+  "deserialization": "CWE-502",
+  "dependency_vulnerability": "CWE-1104",
+  "secret_leak": "CWE-798"
+}

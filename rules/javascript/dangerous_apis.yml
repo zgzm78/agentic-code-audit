@@ -1,0 +1,6 @@
+{
+  "rules": [
+    {"pattern": "child_process\\.(exec|spawn|execSync)", "api": "child_process", "vuln_type": "command_injection", "category": "command", "confidence": 0.8},
+    {"pattern": "\\beval\\s*\\(", "api": "eval", "vuln_type": "code_execution", "category": "code", "confidence": 0.72}
+  ]
+}

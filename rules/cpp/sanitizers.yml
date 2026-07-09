@@ -1,0 +1,9 @@
+{
+  "patterns": [
+    "snprintf\\s*\\(",
+    "strncpy\\s*\\(",
+    "realpath\\s*\\(",
+    "validate",
+    "sanitize"
+  ]
+}

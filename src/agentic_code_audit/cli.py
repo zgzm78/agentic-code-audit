@@ -42,8 +42,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "audit":
         settings = Settings.load(Path(args.project_dir))
-        if not settings.deepseek_api_key:
-            print("DEEPSEEK_API_KEY is required. DeepSeek is mandatory for audit tasks.", file=sys.stderr)
+        if not settings.llm_api_key:
+            print("LLM API key is required. Configure LLM_API_KEY or DEEPSEEK_API_KEY.", file=sys.stderr)
             return 2
         pipeline = AuditPipeline(settings)
         try:
@@ -54,7 +54,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"JSON report: {artifacts.json_path}")
         print(f"Markdown report: {artifacts.markdown_path}")
         print(f"Findings: {len(artifacts.report.findings)}")
-        print(f"DeepSeek enabled: {artifacts.report.llm_enabled}")
+        print(f"LLM enabled: {artifacts.report.llm_enabled}")
+        print(f"LLM provider: {artifacts.report.llm_provider}")
+        print(f"LLM model: {artifacts.report.llm_model}")
         return 0
 
     parser.print_help()

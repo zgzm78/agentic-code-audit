@@ -448,6 +448,26 @@ Secret 与配置：
 - 每个 Agent 调 LLM 前应尽量先调用工具缩小上下文。
 - 工具失败要记录失败原因，不能静默降级。
 
+### 4.5 工具分阶段安装策略
+
+工具不是一次性全部安装完成，而是随系统能力逐步补齐。每个阶段只安装该阶段真正会调用、会解析、会保存证据的工具，避免把开发重点变成环境安装排错。
+
+每次新增工具时必须同步更新：
+
+- `scripts/install_tools.ps1`: Windows 本地 `.tools/` 安装、版本固定、版本检查。
+- `docker/sandbox/Dockerfile`: Docker 沙箱内安装或明确标记 optional。
+- `ToolRegistry`: 注册工具名称、能力、语言适配、required/optional、version args、parser。
+- `ToolParsers`: 如果工具有结构化输出，必须增加 parser。
+- 测试：至少覆盖可用性检测、缺失时状态、parser 输出。
+- 文档：说明安装方式、用途、是否必需、失败降级策略。
+
+分阶段工具范围：
+
+- 阶段二，工具模块基础与核心工具闭环：安装/确保 `rg`、`semgrep`、`gitleaks`、`osv-scanner`、`bandit`、`npm audit`。目标是让 ToolRegistry、ToolRunner、ToolParser、ToolCache 跑通。
+- 阶段三/四，随 Recon 和漏洞挖掘补静态分析工具：接入 `cppcheck`、`clang-tidy`、`pip-audit`、`gosec`、`cargo-audit`；`CodeQL`、`Joern` 先做 optional 检测和 registry 预留，只有在切片/数据流实现真正调用时再安装。
+- 阶段五，随动态验证/利用补运行环境工具：安装/确保 `cmake`、`ninja`、`gcc/g++`、`clang/clang++`、ASAN/UBSAN/LSAN 支持、`valgrind`、`gdb/lldb`、`pytest`、`vitest/jest`、`curl`、`sqlite3` 和常见数据库 client。
+- 后续增强，重型工具：`CodeQL`、`Joern`、`Trivy`、`Syft`、`AFL++`、`libFuzzer` 等需要配套缓存、资源限制和长任务进度后再安装。
+
 ## 5. 耗时问题与并行方案
 
 当前很多步骤耗时长，主要原因通常是：全仓库扫描串行执行、LLM 对每个切片逐个请求、切片范围过大、没有缓存、构建步骤缺少超时、前端没有进度心跳。

@@ -1,0 +1,8 @@
+{
+  "rules": [
+    {"pattern": "os\\.system\\s*\\(", "api": "os.system", "vuln_type": "command_injection", "category": "command", "confidence": 0.82},
+    {"pattern": "subprocess\\.(run|Popen|call|check_output)", "api": "subprocess", "vuln_type": "command_injection", "category": "command", "confidence": 0.76},
+    {"pattern": "pickle\\.loads\\s*\\(", "api": "pickle.loads", "vuln_type": "deserialization", "category": "deserialization", "confidence": 0.76},
+    {"pattern": "yaml\\.load\\s*\\(", "api": "yaml.load", "vuln_type": "deserialization", "category": "deserialization", "confidence": 0.68}
+  ]
+}
