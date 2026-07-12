@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import threading
+import time
+from dataclasses import replace
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -14,7 +19,8 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .audit_budget import AuditMode
-from .config import Settings
+from .config import Settings, save_runtime_llm_settings
+from .llm import DeepSeekClient
 from .pipeline import AuditPipeline
 from .store import AuditStore
 from .tools.runner import ToolRunner
@@ -42,6 +48,17 @@ class TaskCreate(BaseModel):
     runtime_url: str = ""
 
 
+class LLMSettingsUpdate(BaseModel):
+    provider: str = "openai-compatible"
+    base_url: str
+    model: str
+    api_key: str = ""
+
+
+class SystemShutdownRequest(BaseModel):
+    confirmation: str
+
+
 class TaskCancelled(Exception):
     pass
 
@@ -59,7 +76,195 @@ def health() -> dict[str, Any]:
         "build_network_policy": "bridge" if settings.build_network_enabled else "none",
         "sandbox_container": settings.sandbox_container,
         "sandbox_image": settings.sandbox_image,
+        "system_shutdown_available": _system_shutdown_enabled(),
         "db": str(STORE.db_path),
+    }
+
+
+def _system_shutdown_enabled() -> bool:
+    return os.environ.get("AUDIT_ALLOW_SYSTEM_SHUTDOWN", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _docker_output(*arguments: str) -> str:
+    result = subprocess.run(
+        ["docker", *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Docker control command failed")
+    return result.stdout.strip()
+
+
+def _compose_shutdown_targets() -> list[tuple[str, str]]:
+    container_id = Path("/etc/hostname").read_text(encoding="utf-8").strip()
+    project = _docker_output(
+        "inspect",
+        "--format",
+        '{{ index .Config.Labels "com.docker.compose.project" }}',
+        container_id,
+    )
+    if not project:
+        raise RuntimeError("Backend is not running in a Docker Compose project")
+    output = _docker_output(
+        "ps",
+        "--filter",
+        f"label=com.docker.compose.project={project}",
+        "--format",
+        '{{.ID}}|{{.Label "com.docker.compose.service"}}',
+    )
+    targets: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        target_id, _, service = line.partition("|")
+        if target_id and all(character in "0123456789abcdef" for character in target_id.lower()):
+            targets.append((target_id, service or "service"))
+    targets.sort(key=lambda item: (item[1] == "backend", item[1]))
+    if not targets or not any(service == "backend" for _, service in targets):
+        raise RuntimeError("Compose backend container could not be identified")
+    return targets
+
+
+def _launch_compose_shutdown(targets: list[tuple[str, str]], delay_seconds: float = 1.5) -> None:
+    other_ids = [target_id for target_id, service in targets if service != "backend"]
+    backend_ids = [target_id for target_id, service in targets if service == "backend"]
+    helper = """
+import json
+import subprocess
+import sys
+import time
+
+delay = float(sys.argv[1])
+other_ids = json.loads(sys.argv[2])
+backend_ids = json.loads(sys.argv[3])
+time.sleep(delay)
+if other_ids:
+    subprocess.run(["docker", "stop", "-t", "5", *other_ids], check=False)
+if backend_ids:
+    subprocess.Popen(
+        ["docker", "stop", "-t", "5", *backend_ids],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+"""
+    subprocess.Popen(
+        [sys.executable, "-c", helper, str(delay_seconds), json.dumps(other_ids), json.dumps(backend_ids)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def _cancel_running_tasks_for_shutdown() -> int:
+    cancelled = 0
+    for task in STORE.list_tasks():
+        if task.get("status") != "running":
+            continue
+        task_id = str(task["id"])
+        STORE.mark_cancelled(task_id)
+        STORE.add_event(
+            task_id,
+            "System",
+            "task_cancelled",
+            "系统关机，审计任务已停止",
+            phase="cancelled",
+        )
+        cancelled += 1
+    return cancelled
+
+
+@app.post("/api/system/shutdown", status_code=202)
+def shutdown_system(payload: SystemShutdownRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    if not _system_shutdown_enabled():
+        raise HTTPException(status_code=403, detail="System shutdown is disabled for this deployment")
+    if payload.confirmation != "SHUTDOWN":
+        raise HTTPException(status_code=400, detail="Shutdown confirmation is invalid")
+    try:
+        targets = _compose_shutdown_targets()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    cancelled = _cancel_running_tasks_for_shutdown()
+    background_tasks.add_task(_launch_compose_shutdown, targets)
+    return {
+        "status": "shutting_down",
+        "services": [service for _, service in targets],
+        "running_tasks_cancelled": cancelled,
+    }
+
+
+def _public_llm_settings(settings: Settings) -> dict[str, Any]:
+    key = settings.llm_api_key
+    return {
+        "provider": settings.llm_provider,
+        "base_url": settings.llm_base_url,
+        "model": settings.llm_model,
+        "api_key_configured": bool(key),
+        "api_key_hint": f"••••{key[-4:]}" if len(key) >= 4 else ("••••" if key else ""),
+        "runtime_override": (DATA_DIR / "llm-settings.json").is_file(),
+    }
+
+
+def _settings_from_payload(payload: LLMSettingsUpdate) -> Settings:
+    current = Settings.load(APP_ROOT)
+    base_url = payload.base_url.strip().rstrip("/")
+    if base_url.endswith("/chat/completions"):
+        base_url = base_url[: -len("/chat/completions")]
+    if not base_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Base URL must start with http:// or https://")
+    if not payload.model.strip():
+        raise HTTPException(status_code=400, detail="Model is required")
+    return replace(
+        current,
+        llm_provider=payload.provider.strip() or "openai-compatible",
+        llm_api_key=payload.api_key.strip() or current.llm_api_key,
+        llm_base_url=base_url,
+        llm_model=payload.model.strip(),
+    )
+
+
+@app.get("/api/settings/llm")
+def get_llm_settings() -> dict[str, Any]:
+    return _public_llm_settings(Settings.load(APP_ROOT))
+
+
+@app.put("/api/settings/llm")
+def update_llm_settings(payload: LLMSettingsUpdate) -> dict[str, Any]:
+    settings = _settings_from_payload(payload)
+    save_runtime_llm_settings(
+        APP_ROOT,
+        {
+            "LLM_PROVIDER": settings.llm_provider,
+            "LLM_API_KEY": settings.llm_api_key,
+            "LLM_BASE_URL": settings.llm_base_url,
+            "LLM_MODEL": settings.llm_model,
+        },
+    )
+    return _public_llm_settings(settings)
+
+
+@app.post("/api/settings/llm/test")
+def test_llm_settings(payload: LLMSettingsUpdate) -> dict[str, Any]:
+    settings = _settings_from_payload(payload)
+    started = time.perf_counter()
+    response = DeepSeekClient(settings).chat(
+        "You are a connection health check.",
+        "Reply with OK only.",
+        timeout=30,
+    )
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+    return {
+        "ok": response.ok,
+        "latency_ms": elapsed_ms,
+        "model": settings.llm_model,
+        "message": response.content[:120] if response.ok else "",
+        "error": response.error if not response.ok else "",
     }
 
 

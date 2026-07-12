@@ -97,6 +97,93 @@ def make_settings() -> Settings:
     )
 
 
+def test_runtime_llm_settings_override_environment(tmp_path: Path, monkeypatch):
+    from agentic_code_audit.config import save_runtime_llm_settings
+
+    monkeypatch.setenv("LLM_MODEL", "environment-model")
+    save_runtime_llm_settings(
+        tmp_path,
+        {
+            "LLM_PROVIDER": "openai-compatible",
+            "LLM_API_KEY": "runtime-key",
+            "LLM_BASE_URL": "https://example.test/v1",
+            "LLM_MODEL": "runtime-model",
+        },
+    )
+
+    settings = Settings.load(tmp_path)
+
+    assert settings.llm_api_key == "runtime-key"
+    assert settings.llm_model == "runtime-model"
+    assert settings.llm_base_url == "https://example.test/v1"
+
+
+def test_llm_settings_api_masks_key_and_tests_connection(tmp_path: Path, monkeypatch):
+    import agentic_code_audit.server as server_module
+
+    monkeypatch.setattr(server_module, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(server_module, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(
+        server_module.DeepSeekClient,
+        "chat",
+        lambda *_args, **_kwargs: type("Response", (), {"ok": True, "content": "OK", "error": ""})(),
+    )
+    client = TestClient(server_module.app)
+    payload = {
+        "provider": "openai-compatible",
+        "base_url": "https://example.test/v1/chat/completions",
+        "model": "test-model",
+        "api_key": "secret-value",
+    }
+
+    saved = client.put("/api/settings/llm", json=payload)
+    tested = client.post("/api/settings/llm/test", json={**payload, "api_key": ""})
+
+    assert saved.status_code == 200
+    assert saved.json()["base_url"] == "https://example.test/v1"
+    assert saved.json()["api_key_hint"] == "••••alue"
+    assert "secret-value" not in saved.text
+    assert tested.status_code == 200
+    assert tested.json()["ok"] is True
+    assert tested.json()["message"] == "OK"
+
+
+def test_system_shutdown_requires_enablement_and_confirmation(monkeypatch):
+    import agentic_code_audit.server as server_module
+
+    client = TestClient(server_module.app)
+    monkeypatch.delenv("AUDIT_ALLOW_SYSTEM_SHUTDOWN", raising=False)
+    disabled = client.post("/api/system/shutdown", json={"confirmation": "SHUTDOWN"})
+    monkeypatch.setenv("AUDIT_ALLOW_SYSTEM_SHUTDOWN", "1")
+    invalid = client.post("/api/system/shutdown", json={"confirmation": "no"})
+
+    assert disabled.status_code == 403
+    assert invalid.status_code == 400
+
+
+def test_system_shutdown_cancels_tasks_and_schedules_compose_stop(tmp_path: Path, monkeypatch):
+    import agentic_code_audit.server as server_module
+
+    store = AuditStore(tmp_path / "shutdown.sqlite3")
+    task_id = store.create_task("examples/vulnerable-python", "standard", "test-model", "", False)
+    assert store.mark_running(task_id, "Orchestrator", "task_started")
+    targets = [("a" * 12, "frontend"), ("b" * 12, "sandbox"), ("c" * 12, "backend")]
+    launched: list[list[tuple[str, str]]] = []
+    monkeypatch.setenv("AUDIT_ALLOW_SYSTEM_SHUTDOWN", "1")
+    monkeypatch.setattr(server_module, "STORE", store)
+    monkeypatch.setattr(server_module, "_compose_shutdown_targets", lambda: targets)
+    monkeypatch.setattr(server_module, "_launch_compose_shutdown", lambda value: launched.append(value))
+    client = TestClient(server_module.app)
+
+    response = client.post("/api/system/shutdown", json={"confirmation": "SHUTDOWN"})
+
+    assert response.status_code == 202
+    assert response.json()["services"] == ["frontend", "sandbox", "backend"]
+    assert response.json()["running_tasks_cancelled"] == 1
+    assert store.get_task(task_id)["status"] == "cancelled"
+    assert launched == [targets]
+
+
 def test_cli_rejects_missing_deepseek_key(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "")
     monkeypatch.delenv("LLM_API_KEY", raising=False)

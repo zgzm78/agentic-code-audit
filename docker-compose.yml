@@ -9,14 +9,18 @@ services:
     image: agentic-code-audit-backend:local
     command: ["agentic-code-audit-backend"]
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
+      LLM_PROVIDER: "${LLM_PROVIDER:-deepseek}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-https://api.deepseek.com}"
+      LLM_MODEL: "${LLM_MODEL:-deepseek-v4-pro}"
       AUDIT_TOOL_TIMEOUT: "180"
+      AUDIT_ALLOW_SYSTEM_SHUTDOWN: "1"
       AUDIT_SANDBOX_CONTAINER: "agentic-code-audit-sandbox"
       AUDIT_SANDBOX_IMAGE: "agentic-code-audit-sandbox:local"
       DEEPSEEK_MODEL: "deepseek-v4-pro"
     volumes:
-      - ./.env:/app/.env:ro
       - ./data:/app/data
       - ./reports:/app/reports
       - ./runs:/app/runs
@@ -30,9 +34,10 @@ services:
       dockerfile: frontend/Dockerfile
     image: agentic-code-audit-frontend:local
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       VITE_API_BASE_URL: ""
+      VITE_BACKEND_PROXY: "http://backend:8000"
     depends_on:
       - backend
 

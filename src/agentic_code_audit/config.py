@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 def _load_dotenv(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    if not path.exists():
+    if not path.is_file():
         return values
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -18,6 +20,40 @@ def _load_dotenv(path: Path) -> dict[str, str]:
         value = value.strip().strip('"').strip("'")
         values[key] = value
     return values
+
+
+def _load_runtime_llm_settings(project_dir: Path) -> dict[str, str]:
+    path = project_dir / "data" / "llm-settings.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in payload.items()
+        if key in {"LLM_PROVIDER", "LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"}
+        and isinstance(value, str)
+    }
+
+
+def save_runtime_llm_settings(project_dir: Path, values: dict[str, str]) -> Path:
+    data_dir = project_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    path = data_dir / "llm-settings.json"
+    current = _load_runtime_llm_settings(project_dir)
+    current.update({key: value for key, value in values.items() if value is not None})
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
 
 
 def _int_env(name: str, default: int) -> int:
@@ -63,12 +99,14 @@ class Settings:
     @classmethod
     def load(cls, project_dir: Path | None = None) -> "Settings":
         file_values: dict[str, str] = {}
+        root = (project_dir or Path.cwd()).resolve()
         if project_dir:
             file_values.update(_load_dotenv(project_dir / ".env"))
         file_values.update(_load_dotenv(Path.cwd() / ".env"))
+        runtime_values = _load_runtime_llm_settings(root)
 
         def value(name: str, default: str = "") -> str:
-            return os.environ.get(name, file_values.get(name, default))
+            return runtime_values.get(name, os.environ.get(name, file_values.get(name, default)))
 
         def int_value(name: str, default: int) -> int:
             try:

@@ -13,6 +13,10 @@ export type Task = {
   markdown_report?: string;
   findings?: Finding[];
   error?: string;
+  current_agent?: string;
+  current_phase?: string;
+  progress_done?: number;
+  progress_total?: number;
 };
 
 export type EventItem = {
