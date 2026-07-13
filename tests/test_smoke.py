@@ -26,6 +26,7 @@ from agentic_code_audit.agents.verification import (
     CommandInjectionChecker,
     DependencyChecker,
     DynamicPlanner,
+    EnvironmentProfile,
     EnvironmentManager,
     EvidenceChecker,
     ExploitAgent,
@@ -1494,6 +1495,10 @@ def test_report_writer_outputs_chinese_trace_and_verification_sections(tmp_path:
             recommended_tools=["semgrep"],
             attack_priorities=["command injection"],
             verification_hints=["run python harness"],
+            build_entries=[{"kind": "python", "file": "pyproject.toml", "command": "pip install ."}],
+            runtime_entries=[{"kind": "python", "file": "app.py", "command": "python app.py"}],
+            test_entries=[{"kind": "pytest", "file": "tests", "command": "pytest"}],
+            verification_entries=[{"kind": "harness", "file": "harness.py", "command": "python harness.py"}],
         ),
         semantic_index=SemanticIndex(),
         tool_results=[],
@@ -1525,6 +1530,7 @@ def test_report_writer_outputs_chinese_trace_and_verification_sections(tmp_path:
                 runtime_type="python_test",
                 strategy="python_harness_or_pytest",
                 environment_gaps=["missing tool: docker"],
+                payloads=["name=$(id)"],
                 execution={"command": ["python", "harness.py"], "exit_code": 0},
                 checker_details={"checker": "CommandInjectionChecker"},
                 evidence_artifact_ids=["evidence-1"],
@@ -1544,13 +1550,124 @@ def test_report_writer_outputs_chinese_trace_and_verification_sections(tmp_path:
     markdown = markdown_path.read_text(encoding="utf-8")
 
     assert json_path.exists()
-    assert "# 智能体源码安全审计报告" in markdown
-    assert "## 任务摘要" in markdown
+    assert "# Agentic Code Audit 安全审计报告" in markdown
+    assert "## 报告信息" in markdown
+    assert "## 执行摘要" in markdown
+    assert "### 漏洞发现概览" in markdown
+    assert "## 高危 (High) 漏洞" in markdown
+    assert "### HIGH-1: 命令注入" in markdown
+    assert "**漏洞描述:**" in markdown
+    assert "**证据链:**" in markdown
+    assert "## 验证证据" in markdown
     assert "## Artifact 索引" in markdown
-    assert "candidate_id: `candidate-1`" in markdown
+    assert "**复现步骤:**" in markdown
+    assert "**PoC 代码:**" in markdown
+    assert "python harness.py" in markdown
+    assert "## 构建入口" not in markdown
+    assert "## 运行入口" not in markdown
+    assert "## 测试入口" not in markdown
+    assert "## 验证入口" not in markdown
     assert "runtime_type" not in markdown.lower() or "运行类型" in markdown
     assert "evidence_artifact_ids: `evidence-1`" in markdown
     assert "鏅鸿兘" not in markdown
+
+
+def test_report_writer_renders_poc_as_chinese_steps_and_code_not_raw_all_a(tmp_path: Path):
+    run_script = tmp_path / "run_poc.sh"
+    run_script.write_text(
+        "set -e\n"
+        "${CC:-cc} -fsanitize=address,undefined poc_harness.c -o poc_harness\n"
+        "./poc_harness < poc_input.txt\n",
+        encoding="utf-8",
+    )
+    finding = Finding(
+        id="finding-native",
+        vulnerability_type="unsafe_c_string_api",
+        severity="high",
+        title="不安全 C 字符串拷贝",
+        description="stdin reaches strcpy",
+        file_path="src/openvpn/misc.c",
+        line_start=42,
+        function_name="management_query_user_pass_enabled",
+        source="stdin",
+        sink="strcpy",
+        cwe="CWE-120",
+        recommendation="Replace unsafe C string APIs with bounded variants.",
+        exploit_payloads=["A" * 64],
+    )
+    verification = VerificationResult(
+        finding_id=finding.id,
+        status="partial_dynamic_proof",
+        method="anypoc::cpp_cli",
+        reproduction="Partial dynamic proof executed after full runtime was blocked.",
+        proof_level="micro_proof",
+        oracle="ASAN/UBSAN",
+        payloads=["A" * 64],
+        generated_artifacts=[str(run_script)],
+    )
+    report = AuditReport(
+        input_source=InputSource(original="openvpn", kind="git", local_path="openvpn"),
+        target="openvpn",
+        created_at="2026-01-01T00:00:00+00:00",
+        profile=ProjectProfile(root="openvpn", languages={"C": 1}),
+        semantic_index=SemanticIndex(),
+        tool_results=[],
+        dangerous_functions=[],
+        program_slices=[],
+        candidates=[],
+        findings=[finding],
+        verification_results=[verification],
+    )
+
+    markdown = ReportWriter()._to_markdown(report)
+    poc_section = markdown.split("**概念验证 (PoC):**", 1)[1].split("**证据链:**", 1)[0]
+
+    assert "避免继续使用不带边界检查的 C 字符串/内存操作接口" in markdown
+    assert "Replace unsafe C string APIs" not in markdown
+    assert "完整项目构建或运行受阻后" in poc_section
+    assert "**复现步骤:**" in poc_section
+    assert "**PoC 代码:**" in poc_section
+    assert "./poc_harness < poc_input.txt" in poc_section
+    assert "Partial dynamic proof executed after full runtime was blocked." not in poc_section
+    assert "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" not in poc_section
+
+
+def test_report_writer_fallback_poc_is_command_template_not_raw_all_a():
+    finding = Finding(
+        id="finding-stdin",
+        vulnerability_type="unsafe_c_string_api",
+        severity="high",
+        title="stdin 到 strcpy",
+        description="stdin reaches strcpy",
+        file_path="main.c",
+        line_start=7,
+        function_name="parse",
+        source="stdin",
+        sink="strcpy",
+        recommendation="Replace unsafe C string APIs with bounded variants.",
+        exploit_payloads=["A" * 128],
+    )
+    report = AuditReport(
+        input_source=InputSource(original="local", kind="local", local_path="local"),
+        target="local",
+        created_at="2026-01-01T00:00:00+00:00",
+        profile=ProjectProfile(root="local", languages={"C": 1}),
+        semantic_index=SemanticIndex(),
+        tool_results=[],
+        dangerous_functions=[],
+        program_slices=[],
+        candidates=[],
+        findings=[finding],
+        verification_results=[],
+    )
+
+    markdown = ReportWriter()._to_markdown(report)
+    poc_section = markdown.split("**概念验证 (PoC):**", 1)[1].split("**证据链:**", 1)[0]
+
+    assert "cat > poc_input.txt <<'EOF'" in poc_section
+    assert "agentic_audit_case=finding-stdin" in poc_section
+    assert "payload=<根据目标协议填写触发字段>" in poc_section
+    assert "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" not in poc_section
 
 
 def test_report_json_endpoint_returns_file_and_404(tmp_path: Path, monkeypatch):
@@ -2189,6 +2306,22 @@ def test_phase8_cmake_wrong_build_system_reason_is_stable():
     assert manager._classify_build_failure("", "CMake is only used for Windows; use autoconfig on Unix") == "wrong_build_system"
 
 
+def test_phase8_autotools_requires_bootstrap_tools():
+    manager = BuildManager()
+    calls: list[list[str]] = []
+
+    def fake_has_any(tools: list[str]) -> bool:
+        calls.append(tools)
+        return True
+
+    manager._sandbox_has_any_tool = fake_has_any  # type: ignore[method-assign]
+
+    assert manager._missing_build_tools("autotools") == []
+    assert ["autoreconf", "autoconf"] in calls
+    assert ["automake", "aclocal"] in calls
+    assert ["libtoolize", "libtool"] in calls
+
+
 def test_phase8_dynamic_planner_accepts_structured_recipe(tmp_path: Path):
     class PlannerLLM:
         enabled = True
@@ -2291,6 +2424,228 @@ def test_phase8_blocked_runtime_uses_partial_proof_without_verified_status(tmp_p
     assert outcome.status != "verified"
     assert outcome.checker_details["proof_level"] == "micro_proof"
     assert outcome.checker_details["fallback_attempts"][0]["status"] == "partial_dynamic_proof"
+
+
+def test_phase8_verification_agent_routes_blocked_build_to_partial_proof(tmp_path: Path, monkeypatch):
+    import agentic_code_audit.agents.verification as verification_module
+
+    (tmp_path / "main.c").write_text("void f(char *s) { char d[8]; strcpy(d, s); }\n", encoding="utf-8")
+    finding = _phase5_finding("unsafe_c_string_api", "main.c")
+    finding.risk_domain = "source_code"
+    finding.source = "stdin"
+    finding.sink = "strcpy"
+    profile = ProjectProfile(root=str(tmp_path), languages={"C": 1})
+    monkeypatch.setattr(verification_module.shutil, "which", lambda name: "docker" if name == "docker" else sys.executable)
+
+    agent = VerificationAgent()
+    monkeypatch.setattr(agent.environment_manager, "inspect", lambda *_args, **_kwargs: EnvironmentProfile(
+        runtime_type="cpp_cli",
+        languages={"C": 1},
+        project_type="cli",
+        build_systems=["autotools"],
+        can_execute=True,
+    ))
+    monkeypatch.setattr(agent.build_manager, "prepare", lambda *_args, **_kwargs: (
+        BuildDecision(True, "failed", build_system="autotools", status="blocked", blocked_reason="build_failed"),
+        None,
+    ))
+    monkeypatch.setattr(agent.sandbox, "execute", lambda harness, work_dir: CheckerOutcome(
+        status="verified",
+        summary="partial marker",
+        stdout_excerpt="[DETECTED] partial dynamic proof",
+        exit_code=0,
+        sandbox_command=["docker", "run", "--network", "none"],
+        checker_details={"checker": "SandboxExecutor"},
+    ))
+
+    result = agent.verify(tmp_path, [finding], tmp_path / "out", profile, enable_native_build=True)[0]
+
+    assert result.status == "partial_dynamic_proof"
+    assert result.proof_level == "micro_proof"
+    assert result.fallback_attempts
+
+
+def test_phase8_native_stdin_poc_uses_text_payload_plan(tmp_path: Path):
+    finding = _phase5_finding("unsafe_c_string_api", "main.c")
+    finding.source = "stdin"
+    finding.sink = "strcpy"
+    finding.trigger_conditions = ["stdin"]
+    finding.exploit_payloads = ["username\n" + ("A" * 64)]
+    analysis = PocAnalysis("valid", "cpp_cli", "asan_crash", "details")
+    plan = {
+        "verification_recipe": {
+            "payload_format": "stdin_text",
+            "payloads": ["NEED-OK|Auth|user", "A" * 128],
+            "stdin_script": "NEED-OK|Auth|user\n" + ("A" * 128),
+            "execution_steps": ["pipe poc_input.txt to stdin"],
+        }
+    }
+
+    poc = PocGenerator().generate(tmp_path, finding, analysis, tmp_path / "out", structured_plan=plan)
+
+    assert poc.poc_path.name == "poc_input.txt"
+    assert "NEED-OK|Auth|user" in poc.poc_path.read_text(encoding="utf-8")
+    assert plan["poc_payload_plan"]["format"] == "stdin_text"
+
+
+def test_phase8_native_stdin_fallback_avoids_all_a_payload(tmp_path: Path):
+    finding = _phase5_finding("unsafe_c_string_api", "main.c")
+    finding.source = "stdin"
+    finding.sink = "strcpy"
+    finding.trigger_conditions = ["stdin"]
+    finding.exploit_payloads = ["A" * 4096]
+    analysis = PocAnalysis("valid", "cpp_cli", "asan_crash", "details")
+    structured_plan = {"verification_recipe": {"payload_format": "generic_overflow_probe"}}
+
+    poc = PocGenerator().generate(tmp_path, finding, analysis, tmp_path / "out", structured_plan=structured_plan)
+    content = poc.poc_path.read_text(encoding="utf-8")
+
+    assert poc.poc_path.name == "poc_input.txt"
+    assert "agentic_audit_case=" in content
+    assert "sink=strcpy" in content
+    assert content.strip("A\n ") != ""
+    bug_report = (tmp_path / "out" / "pocs" / finding.id / "bug_report.md").read_text(encoding="utf-8")
+    assert "agentic_audit_case=" in bug_report
+    assert "sink=strcpy" in bug_report
+    assert ("- `" + ("A" * 128)) not in bug_report
+
+
+def test_phase8_llm_payload_planner_can_replace_generic_overflow_probe(tmp_path: Path):
+    class PayloadLLM:
+        enabled = True
+
+        def chat(self, *_args, **_kwargs):
+            content = json.dumps({
+                "format": "stdin_text",
+                "payloads": ["username", "password"],
+                "stdin_script": "username\npassword\n",
+                "execution_steps": ["pipe into stdin"],
+                "expected_signal": "asan_crash",
+                "limitations": ["requires focused harness"],
+            })
+            return type("Resp", (), {"ok": True, "content": content, "error": ""})()
+
+    finding = _phase5_finding("unsafe_c_string_api", "main.c")
+    finding.source = "stdin"
+    finding.sink = "strcpy"
+    finding.exploit_payloads = ["A" * 4096]
+    analysis = PocAnalysis("valid", "cpp_cli", "asan_crash", "details")
+    structured_plan = {"verification_recipe": {"payload_format": "generic_overflow_probe"}}
+
+    poc = PocGenerator(PayloadLLM()).generate(tmp_path, finding, analysis, tmp_path / "out", structured_plan=structured_plan)
+
+    assert poc.poc_path.name == "poc_input.txt"
+    assert "username" in poc.poc_path.read_text(encoding="utf-8")
+    assert structured_plan["poc_payload_plan"]["source"] == "llm_payload_planner"
+
+
+def test_phase8_llm_payload_planner_writes_runnable_harness_artifacts(tmp_path: Path):
+    class PayloadLLM:
+        enabled = True
+
+        def chat(self, *_args, **_kwargs):
+            content = json.dumps({
+                "format": "stdin_text",
+                "payloads": ["username=admin\npassword=long-boundary-value\n"],
+                "stdin_script": "username=admin\npassword=long-boundary-value\n",
+                "harness_language": "c",
+                "harness_filename": "openvpn_userpass_harness.c",
+                "harness_code": "#include <stdio.h>\nint main(void) { puts(\"local harness\"); return 0; }\n",
+                "run_commands": ["${CC:-cc} -fsanitize=address,undefined poc_harness.c -o poc_harness", "./poc_harness < poc_input.txt"],
+                "poc_explanation": "Feed a username/password style record into the focused user-pass harness.",
+                "execution_steps": ["compile poc_harness.c", "run with poc_input.txt"],
+                "expected_signal": "asan_crash",
+                "limitations": ["focused harness"],
+            })
+            return type("Resp", (), {"ok": True, "content": content, "error": ""})()
+
+    finding = _phase5_finding("unsafe_c_string_api", "main.c")
+    finding.source = "stdin"
+    finding.sink = "strcpy"
+    finding.exploit_payloads = ["A" * 4096]
+    analysis = PocAnalysis("valid", "cpp_cli", "asan_crash", "details")
+    structured_plan = {"verification_recipe": {"payload_format": "generic_overflow_probe"}}
+
+    poc = PocGenerator(PayloadLLM()).generate(tmp_path, finding, analysis, tmp_path / "out", structured_plan=structured_plan)
+    poc_dir = tmp_path / "out" / "pocs" / finding.id
+
+    assert poc.poc_path.name == "poc_input.txt"
+    assert (poc_dir / "poc_harness.c").exists()
+    assert (poc_dir / "run_poc.sh").exists()
+    assert (poc_dir / "poc_explanation.md").exists()
+    assert "username=admin" in poc.poc_path.read_text(encoding="utf-8")
+    assert "local harness" in (poc_dir / "poc_harness.c").read_text(encoding="utf-8")
+    assert "Feed a username/password" in (poc_dir / "poc_explanation.md").read_text(encoding="utf-8")
+    assert any(Path(path).name == "poc_harness.c" for path in poc.generated_artifacts)
+    assert any(Path(path).name == "run_poc.sh" for path in poc.generated_artifacts)
+
+
+def test_phase8_llm_all_a_payload_plan_is_rejected(tmp_path: Path):
+    class PayloadLLM:
+        enabled = True
+
+        def chat(self, *_args, **_kwargs):
+            content = json.dumps({
+                "format": "stdin_input",
+                "payloads": ["A" * 512],
+                "stdin_script": "echo 'AAAAAAAA...' | ./harness",
+                "execution_steps": ["pipe into harness"],
+                "limitations": ["generic overflow probe"],
+            })
+            return type("Resp", (), {"ok": True, "content": content, "error": ""})()
+
+    finding = _phase5_finding("unsafe_c_string_api", "main.c")
+    finding.source = "stdin"
+    finding.sink = "strcpy"
+    finding.trigger_conditions = ["stdin"]
+    finding.exploit_payloads = ["A" * 4096]
+    analysis = PocAnalysis("valid", "cpp_cli", "asan_crash", "details")
+    structured_plan = {"verification_recipe": {"payload_format": "generic_overflow_probe"}}
+
+    poc = PocGenerator(PayloadLLM()).generate(tmp_path, finding, analysis, tmp_path / "out", structured_plan=structured_plan)
+    content = poc.poc_path.read_text(encoding="utf-8")
+
+    assert poc.poc_path.name == "poc_input.txt"
+    assert structured_plan["poc_payload_plan"]["source"] == "deterministic"
+    assert "agentic_audit_case=" in content
+    assert "echo 'AAAAAAAA...'" not in content
+    bug_report = (tmp_path / "out" / "pocs" / finding.id / "bug_report.md").read_text(encoding="utf-8")
+    assert "agentic_audit_case=" in bug_report
+    assert "echo 'AAAAAAAA...'" not in bug_report
+
+
+def test_phase8_llm_all_a_payload_with_harness_keeps_code_and_repairs_input(tmp_path: Path):
+    class PayloadLLM:
+        enabled = True
+
+        def chat(self, *_args, **_kwargs):
+            content = json.dumps({
+                "format": "stdin_input",
+                "payloads": ["A" * 512],
+                "stdin_script": "echo 'AAAAAAAA...' | ./harness",
+                "harness_language": "c",
+                "harness_code": "#include <stdio.h>\nint main(void) { puts(\"kept harness\"); return 0; }\n",
+                "execution_steps": ["compile harness"],
+                "limitations": ["payload must be repaired"],
+            })
+            return type("Resp", (), {"ok": True, "content": content, "error": ""})()
+
+    finding = _phase5_finding("unsafe_c_string_api", "main.c")
+    finding.source = "stdin"
+    finding.sink = "strcpy"
+    finding.trigger_conditions = ["stdin"]
+    finding.exploit_payloads = ["A" * 4096]
+    analysis = PocAnalysis("valid", "cpp_cli", "asan_crash", "details")
+    structured_plan = {"verification_recipe": {"payload_format": "generic_overflow_probe"}}
+
+    poc = PocGenerator(PayloadLLM()).generate(tmp_path, finding, analysis, tmp_path / "out", structured_plan=structured_plan)
+    poc_dir = tmp_path / "out" / "pocs" / finding.id
+    content = poc.poc_path.read_text(encoding="utf-8")
+
+    assert structured_plan["poc_payload_plan"]["source"].endswith("+structured_input")
+    assert "agentic_audit_case=" in content
+    assert "echo 'AAAAAAAA...'" not in content
+    assert "kept harness" in (poc_dir / "poc_harness.c").read_text(encoding="utf-8")
 
 
 def test_phase7_cmake_build_uses_ephemeral_offline_container(tmp_path: Path, monkeypatch):

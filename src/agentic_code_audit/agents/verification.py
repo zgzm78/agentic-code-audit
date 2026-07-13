@@ -851,7 +851,13 @@ class BuildManager:
     def _missing_build_tools(self, build_system: str) -> list[str]:
         required: dict[str, list[str]] = {
             "cmake": ["cmake", "clang or gcc"],
-            "autotools": ["make", "clang or gcc"],
+            "autotools": [
+                "make",
+                "clang or gcc",
+                "autoreconf or autoconf",
+                "automake or aclocal",
+                "libtoolize or libtool",
+            ],
             "make": ["make", "clang or gcc"],
             "meson": ["meson", "ninja", "clang or gcc"],
         }
@@ -1413,6 +1419,9 @@ Finding 信息:
 class PocGenerator:
     """Generate stable PoC/runbook artifacts without treating them as proof."""
 
+    def __init__(self, llm_client: DeepSeekClient | None = None) -> None:
+        self.llm_client = llm_client
+
     def generate(
         self,
         target: Path,
@@ -1425,25 +1434,42 @@ class PocGenerator:
         poc_dir = output_dir / "pocs" / finding.id
         poc_dir.mkdir(parents=True, exist_ok=True)
 
-        bug_report = poc_dir / "bug_report.md"
-        bug_report.write_text(self._bug_report(finding, analysis), encoding="utf-8")
+        payload_plan: dict[str, Any] | None = None
+        extra_artifacts: list[Path] = []
         if analysis.verification_mode == "http":
             poc_path = poc_dir / "poc_http.py"
             poc_path.write_text(self._http_poc(finding), encoding="utf-8")
         elif analysis.verification_mode in {"cpp_cli", "cpp_harness"}:
-            poc_path = poc_dir / "poc_input.bin"
-            poc_path.write_bytes(self._native_payload(finding))
+            payload_plan = self._payload_plan(target, finding, analysis, structured_plan or {})
+            if self._payload_is_text(payload_plan):
+                poc_path = poc_dir / "poc_input.txt"
+                poc_path.write_text(self._native_text_payload(finding, payload_plan), encoding="utf-8")
+            else:
+                poc_path = poc_dir / "poc_input.bin"
+                poc_path.write_bytes(self._native_payload(finding, payload_plan))
+            if structured_plan is not None:
+                structured_plan["poc_payload_plan"] = payload_plan
+            extra_artifacts = self._write_verification_poc_artifacts(
+                poc_dir,
+                finding,
+                analysis,
+                payload_plan,
+                poc_path,
+                structured_plan or {},
+            )
         else:
             poc_path = poc_dir / "poc_manual.md"
             poc_path.write_text(self._manual_poc(finding, analysis), encoding="utf-8")
 
+        bug_report = poc_dir / "bug_report.md"
+        bug_report.write_text(self._bug_report(finding, analysis, payload_plan), encoding="utf-8")
         plan = PocPlan(
             finding=finding,
             analysis=analysis,
             poc_dir=poc_dir,
             poc_path=poc_path,
             payload_paths=[poc_path] if analysis.verification_mode in {"cpp_cli", "cpp_harness"} else [],
-            generated_artifacts=[bug_report, poc_path],
+            generated_artifacts=[bug_report, poc_path, *extra_artifacts],
             structured_plan=structured_plan or {},
         )
         if analysis.verification_mode == "cpp_cli":
@@ -1455,8 +1481,8 @@ class PocGenerator:
         plan.generated_artifacts.append(runbook)
         return plan
 
-    def _bug_report(self, finding: Finding, analysis: PocAnalysis) -> str:
-        payloads = "\n".join(f"- `{payload}`" for payload in finding.exploit_payloads) or "- n/a"
+    def _bug_report(self, finding: Finding, analysis: PocAnalysis, payload_plan: dict[str, Any] | None = None) -> str:
+        payloads = "\n".join(f"- `{payload}`" for payload in self._report_payloads(finding, payload_plan)) or "- n/a"
         evidence = "\n".join(f"- {item}" for item in finding.evidence) or "- n/a"
         chain = "\n".join(f"- {step}" for step in finding.exploit_chain) or "- n/a"
         return "\n".join(
@@ -1484,6 +1510,28 @@ class PocGenerator:
                 evidence,
             ]
         )
+
+    def _report_payloads(self, finding: Finding, payload_plan: dict[str, Any] | None = None) -> list[str]:
+        if payload_plan:
+            stdin_script = str(payload_plan.get("stdin_script") or "").strip()
+            if stdin_script:
+                return [stdin_script]
+            payloads = [str(item) for item in payload_plan.get("payloads", []) if str(item)]
+            if payloads and not all(self._is_low_information_payload(payload) for payload in payloads):
+                return payloads
+        payloads = [str(item) for item in finding.exploit_payloads if str(item)]
+        if payloads and not all(self._is_low_information_payload(payload) for payload in payloads):
+            return payloads
+        return [
+            "\n".join(
+                [
+                    f"agentic_audit_case={finding.id}",
+                    f"source={finding.source or 'unknown'}",
+                    f"sink={finding.sink or 'unknown'}",
+                    "payload=<target-specific input required>",
+                ]
+            )
+        ]
 
     def _http_poc(self, finding: Finding) -> str:
         route_path = finding.route.split(" ", 1)[1] if " " in finding.route else finding.route
@@ -1526,13 +1574,499 @@ with urlopen(url, timeout=10) as response:
             ]
         )
 
-    def _native_payload(self, finding: Finding) -> bytes:
+    def _payload_plan(
+        self,
+        target: Path,
+        finding: Finding,
+        analysis: PocAnalysis,
+        structured_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        recipe = structured_plan.get("verification_recipe") if isinstance(structured_plan.get("verification_recipe"), dict) else {}
+        plan = {
+            "source": "deterministic",
+            "format": str(recipe.get("payload_format") or ""),
+            "payloads": self._coerce_text_list(recipe.get("payloads") or finding.exploit_payloads[:5]),
+            "stdin_script": str(recipe.get("stdin_script") or ""),
+            "cli_args": self._coerce_text_list(recipe.get("cli_args")),
+            "config_files": self._coerce_text_list(recipe.get("config_files")),
+            "execution_steps": self._coerce_text_list(recipe.get("execution_steps")),
+            "harness_code": str(recipe.get("harness_code") or ""),
+            "limitations": self._coerce_text_list(recipe.get("limitations")),
+        }
+        if self._payload_is_specific(plan):
+            return plan
+        llm_plan = self._llm_payload_plan(target, finding, analysis, structured_plan)
+        if llm_plan and self._payload_is_specific(llm_plan):
+            return llm_plan
+        if llm_plan and self._plan_has_harness(llm_plan):
+            repaired = self._replace_low_information_payload(llm_plan, finding)
+            if self._payload_is_specific(repaired):
+                return repaired
+        return self._fallback_payload_plan(finding)
+
+    def _llm_payload_plan(
+        self,
+        target: Path,
+        finding: Finding,
+        analysis: PocAnalysis,
+        structured_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self.llm_client or not hasattr(self.llm_client, "chat") or getattr(self.llm_client, "enabled", True) is False:
+            return {}
+        source_excerpt = self._source_excerpt(target, finding)
+        prompt = (
+            "Generate a concrete, local-only PoC input plan for an authorized source-code audit finding. "
+            "Follow the DeepAudit-style approach: understand the target function, design protocol-aware payloads, "
+            "and propose a harness or stdin/config input when the whole application cannot run. "
+            "Return JSON only with keys: format, payloads, stdin_script, cli_args, config_files, execution_steps, "
+            "harness_code, harness_language, harness_filename, run_commands, poc_explanation, oracle, expected_signal, limitations. "
+            "stdin_script must be exact stdin content, not a shell command. "
+            "harness_code must be runnable local PoC code when full target execution is unavailable. "
+            "Do not claim success. Do not use network. Do not use destructive commands. "
+            "Avoid generic 'AAAA...' unless it is explicitly the last-resort overflow probe.\n"
+            + json.dumps(
+                {
+                    "finding": {
+                        "id": finding.id,
+                        "type": finding.vulnerability_type,
+                        "file": finding.file_path,
+                        "function": finding.function_name,
+                        "source": finding.source,
+                        "sink": finding.sink,
+                        "trigger_conditions": finding.trigger_conditions,
+                        "code_snippet": finding.code_snippet[:2000],
+                    },
+                    "analysis": asdict(analysis),
+                    "verification_plan": structured_plan,
+                    "source_excerpt": source_excerpt,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        try:
+            response = self.llm_client.chat(
+                "You generate safe local PoC input plans and harness sketches. Output JSON only.",
+                prompt,
+                timeout=60,
+            )
+        except Exception:
+            return {}
+        if not response.ok:
+            return {}
+        parsed = self._parse_json_object(response.content)
+        if not parsed:
+            return {}
+        return self._sanitize_payload_plan(parsed, source="llm_payload_planner")
+
+    def _fallback_payload_plan(self, finding: Finding) -> dict[str, Any]:
+        if finding.source == "stdin" or "stdin" in finding.trigger_conditions:
+            seed = finding.exploit_payloads[0] if finding.exploit_payloads else ""
+            if self._is_low_information_payload(seed):
+                long_field = "A" * 512
+                seed = "\n".join(
+                    [
+                        f"agentic_audit_case={finding.id}",
+                        f"target_function={finding.function_name or 'unknown'}",
+                        f"source={finding.source or 'stdin'}",
+                        f"sink={finding.sink or 'unknown'}",
+                        f"payload={long_field}",
+                    ]
+                )
+            return {
+                "source": "deterministic",
+                "format": "stdin_text",
+                "payloads": [seed],
+                "stdin_script": seed,
+                "cli_args": [],
+                "config_files": [],
+                "execution_steps": ["Feed poc_input.txt to the target stdin or to a focused harness."],
+                "harness_code": "",
+                "limitations": ["Generic stdin payload; target-specific protocol was not available."],
+            }
+        return {
+            "source": "deterministic",
+            "format": "generic_overflow_probe",
+            "payloads": list(finding.exploit_payloads[:3]),
+            "stdin_script": "",
+            "cli_args": [],
+            "config_files": [],
+            "execution_steps": ["Replay poc_input.bin through the parser/CLI or focused harness."],
+            "harness_code": "",
+            "limitations": ["Generic overflow probe; not protocol-specific."],
+        }
+
+    def _native_payload(self, finding: Finding, payload_plan: dict[str, Any] | None = None) -> bytes:
+        payload_plan = payload_plan or {}
+        payloads = [str(item) for item in payload_plan.get("payloads", []) if str(item)]
+        if payloads and payload_plan.get("format") not in {"generic_overflow_probe", "binary"}:
+            return ("\n".join(payloads) + "\n").encode("utf-8", errors="replace")
         marker = f"AGENTIC_CODE_AUDIT_{finding.id}".encode("ascii", errors="ignore")
         if finding.vulnerability_type in {"unsafe_memory_copy", "unsafe_c_string_api", "memory_corruption"}:
             return marker + b"\x00" + (b"A" * 8192) + b"\xff\xd8\xff\xe0" + b"B" * 2048
         if finding.vulnerability_type == "path_traversal":
             return b"../../../../etc/passwd\x00" + marker
         return marker + b"\n" + (b"A" * 4096)
+
+    def _native_text_payload(self, finding: Finding, payload_plan: dict[str, Any]) -> str:
+        lines = [
+            f"# PoC input plan for {finding.id}",
+            f"# format: {payload_plan.get('format') or 'stdin_text'}",
+            f"# source: {payload_plan.get('source') or 'unknown'}",
+            "",
+        ]
+        config_files = payload_plan.get("config_files") or []
+        if config_files:
+            lines.extend(["# config_files:", json.dumps(config_files, ensure_ascii=False, indent=2), ""])
+        stdin_script = str(payload_plan.get("stdin_script") or "")
+        if stdin_script:
+            lines.extend([stdin_script, ""])
+        else:
+            payloads = [str(item) for item in payload_plan.get("payloads", []) if str(item)]
+            lines.extend(payloads or finding.exploit_payloads or ["A" * 512])
+        return "\n".join(lines)
+
+    def _write_verification_poc_artifacts(
+        self,
+        poc_dir: Path,
+        finding: Finding,
+        analysis: PocAnalysis,
+        payload_plan: dict[str, Any],
+        poc_path: Path,
+        structured_plan: dict[str, Any],
+    ) -> list[Path]:
+        artifacts: list[Path] = []
+        recipe = structured_plan.get("verification_recipe") if isinstance(structured_plan.get("verification_recipe"), dict) else {}
+        explanation_path = poc_dir / "poc_explanation.md"
+        explanation_path.write_text(
+            self._poc_explanation(finding, analysis, payload_plan, recipe),
+            encoding="utf-8",
+        )
+        artifacts.append(explanation_path)
+
+        harness_code, harness_name, harness_language = self._extract_harness_code(payload_plan)
+        if not harness_code and finding.vulnerability_type in {"unsafe_memory_copy", "unsafe_c_string_api", "memory_corruption"}:
+            harness_code = self._deterministic_c_poc_harness(finding)
+            harness_name = "poc_harness.c"
+            harness_language = "c"
+        harness_path: Path | None = None
+        if harness_code and self._harness_code_is_safe(harness_code):
+            harness_path = poc_dir / self._safe_harness_filename(harness_name, harness_language)
+            harness_path.write_text(harness_code, encoding="utf-8")
+            artifacts.append(harness_path)
+
+        run_path = poc_dir / "run_poc.sh"
+        run_path.write_text(
+            self._run_poc_script(payload_plan, poc_path, harness_path),
+            encoding="utf-8",
+        )
+        try:
+            os.chmod(run_path, 0o755)
+        except OSError:
+            pass
+        artifacts.append(run_path)
+        return artifacts
+
+    def _poc_explanation(
+        self,
+        finding: Finding,
+        analysis: PocAnalysis,
+        payload_plan: dict[str, Any],
+        recipe: dict[str, Any],
+    ) -> str:
+        steps = "\n".join(f"- {step}" for step in self._coerce_text_list(payload_plan.get("execution_steps"))) or "- Run `sh run_poc.sh` inside the sandbox or local build environment."
+        limitations = "\n".join(f"- {item}" for item in self._coerce_text_list(payload_plan.get("limitations"))) or "- This PoC is evidence for validation, not an exploit guarantee."
+        explanation = str(payload_plan.get("poc_explanation") or "").strip()
+        if not explanation:
+            explanation = (
+                f"验证思路：围绕 `{finding.function_name or recipe.get('target_function') or 'target function'}` "
+                f"构造本地输入，使 Source `{finding.source or recipe.get('source') or 'unknown'}` "
+                f"到达 Sink `{finding.sink or recipe.get('sink') or 'unknown'}`，并用 `{analysis.oracle}` 作为判定信号。"
+            )
+        return "\n".join(
+            [
+                f"# PoC Explanation: {finding.id}",
+                "",
+                explanation,
+                "",
+                f"- Target function: `{recipe.get('target_function') or finding.function_name or 'unknown'}`",
+                f"- Source: `{recipe.get('source') or finding.source or 'unknown'}`",
+                f"- Sink: `{recipe.get('sink') or finding.sink or 'unknown'}`",
+                f"- Oracle: `{payload_plan.get('oracle') or payload_plan.get('expected_signal') or analysis.oracle}`",
+                f"- Plan source: `{payload_plan.get('source') or 'unknown'}`",
+                "",
+                "## Steps",
+                steps,
+                "",
+                "## Limitations",
+                limitations,
+                "",
+                "## Artifacts",
+                "- `poc_input.txt` or `poc_input.bin`: local input sample",
+                "- `poc_harness.*`: runnable local harness when available",
+                "- `run_poc.sh`: local no-network execution script",
+            ]
+        )
+
+    def _extract_harness_code(self, payload_plan: dict[str, Any]) -> tuple[str, str, str]:
+        harness_code = str(payload_plan.get("harness_code") or "").strip()
+        harness_language = str(payload_plan.get("harness_language") or "").strip().lower()
+        harness_name = str(payload_plan.get("harness_filename") or "").strip()
+        if harness_code:
+            return harness_code, harness_name, harness_language
+        for item in self._coerce_text_list(payload_plan.get("config_files")):
+            parsed = self._parse_mapping(item)
+            content = str(parsed.get("content") or parsed.get("code") or "").strip()
+            path = str(parsed.get("path") or parsed.get("filename") or "").strip()
+            if content and self._looks_like_harness_path(path):
+                return content, path, self._language_from_filename(path)
+        return "", "", ""
+
+    @staticmethod
+    def _parse_mapping(value: str) -> dict[str, Any]:
+        text = str(value or "").strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                parsed = ast.literal_eval(text)
+            except (ValueError, SyntaxError):
+                return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _looks_like_harness_path(path: str) -> bool:
+        name = Path(path).name.lower()
+        return "harness" in name or name.startswith("poc_") or name in {"repro.c", "reproducer.c"}
+
+    @staticmethod
+    def _language_from_filename(path: str) -> str:
+        suffix = Path(path).suffix.lower()
+        if suffix == ".c":
+            return "c"
+        if suffix in {".cc", ".cpp", ".cxx"}:
+            return "cpp"
+        if suffix == ".py":
+            return "python"
+        if suffix in {".sh", ".bash"}:
+            return "shell"
+        return ""
+
+    def _safe_harness_filename(self, harness_name: str, harness_language: str) -> str:
+        name = Path(harness_name or "").name
+        if not name or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            ext = { "cpp": ".cpp", "c++": ".cpp", "python": ".py", "shell": ".sh", "sh": ".sh" }.get(harness_language, ".c")
+            name = f"poc_harness{ext}"
+        if not name.startswith("poc_harness"):
+            suffix = Path(name).suffix or { "cpp": ".cpp", "c++": ".cpp", "python": ".py", "shell": ".sh", "sh": ".sh" }.get(harness_language, ".c")
+            name = f"poc_harness{suffix}"
+        return name
+
+    @staticmethod
+    def _harness_code_is_safe(harness_code: str) -> bool:
+        lowered = harness_code.lower()
+        blocked = [
+            "system(",
+            "popen(",
+            "execl",
+            "execv",
+            "fork(",
+            "socket(",
+            "connect(",
+            "curl ",
+            "wget ",
+            "unlink(",
+            "remove(",
+            "rmdir(",
+        ]
+        return not any(token in lowered for token in blocked)
+
+    def _deterministic_c_poc_harness(self, finding: Finding) -> str:
+        source = (finding.source or "stdin").replace('"', '\\"')[:120]
+        sink = (finding.sink or "strcpy").replace('"', '\\"')[:120]
+        return f'''#include <stdio.h>
+#include <string.h>
+
+int main(void) {{
+    char dst[32];
+    char input[512];
+    if (!fgets(input, sizeof(input), stdin)) {{
+        return 2;
+    }}
+    input[strcspn(input, "\\n")] = '\\0';
+    printf("[HARNESS] source: {source}\\n");
+    printf("[HARNESS] sink: {sink}\\n");
+    strcpy(dst, input);
+    printf("[HARNESS] copied input into fixed buffer\\n");
+    return 0;
+}}
+'''
+
+    def _run_poc_script(self, payload_plan: dict[str, Any], poc_path: Path, harness_path: Path | None) -> str:
+        commands = self._safe_run_commands(payload_plan)
+        if commands:
+            body = "\n".join(commands)
+        elif harness_path:
+            name = shlex.quote(harness_path.name)
+            input_name = shlex.quote(poc_path.name)
+            suffix = harness_path.suffix.lower()
+            if suffix in {".c", ".cc", ".cpp", ".cxx"}:
+                compiler = "${CXX:-c++}" if suffix in {".cc", ".cpp", ".cxx"} else "${CC:-cc}"
+                body = "\n".join(
+                    [
+                        f'{compiler} -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer {name} -o poc_harness',
+                        f'ASAN_OPTIONS=detect_stack_use_after_return=1 ./poc_harness < {input_name}',
+                    ]
+                )
+            elif suffix == ".py":
+                body = f"python {name} < {input_name}"
+            else:
+                body = f"sh {name}"
+        else:
+            body = "printf '%s\\n' 'No runnable harness was generated for this finding.'"
+        return "\n".join(
+            [
+                "#!/bin/sh",
+                "set -eu",
+                'cd "$(dirname "$0")"',
+                "# Local-only PoC runner. Do not enable network access for verification.",
+                body,
+                "",
+            ]
+        )
+
+    def _safe_run_commands(self, payload_plan: dict[str, Any]) -> list[str]:
+        safe: list[str] = []
+        for command in self._coerce_text_list(payload_plan.get("run_commands")):
+            text = command.strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if any(token in lowered for token in ["curl ", "wget ", " nc ", " ncat ", "rm -", "sudo ", "chmod 777", "://"]):
+                continue
+            safe.append(text)
+        return safe[:5]
+
+    @staticmethod
+    def _payload_is_text(payload_plan: dict[str, Any]) -> bool:
+        fmt = str(payload_plan.get("format", "")).lower()
+        return fmt in {"stdin_text", "stdin_input", "text", "cli_session", "config", "http_request"} or bool(payload_plan.get("stdin_script"))
+
+    def _payload_is_specific(self, payload_plan: dict[str, Any]) -> bool:
+        fmt = str(payload_plan.get("format", "")).lower()
+        if self._payload_plan_is_low_information(payload_plan):
+            return False
+        if fmt and fmt != "generic_overflow_probe":
+            return True
+        return bool(payload_plan.get("stdin_script") or payload_plan.get("config_files") or payload_plan.get("harness_code"))
+
+    @staticmethod
+    def _sanitize_payload_plan(plan: dict[str, Any], source: str) -> dict[str, Any]:
+        sanitized: dict[str, Any] = {"source": source}
+        for key in ("format", "stdin_script", "harness_code", "harness_language", "harness_filename", "poc_explanation", "oracle", "expected_signal"):
+            value = plan.get(key)
+            if value is not None:
+                sanitized[key] = str(value)[:12000]
+        for key in ("payloads", "cli_args", "config_files", "execution_steps", "run_commands", "limitations"):
+            value = plan.get(key)
+            if isinstance(value, list):
+                sanitized[key] = [str(item)[:2000] for item in value[:12]]
+            elif value:
+                sanitized[key] = [str(value)[:2000]]
+            else:
+                sanitized[key] = []
+        sanitized.setdefault("format", "stdin_text")
+        return sanitized
+
+    @staticmethod
+    def _coerce_text_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item)]
+        if isinstance(value, tuple | set):
+            return [str(item) for item in value if str(item)]
+        if isinstance(value, dict):
+            return [json.dumps(value, ensure_ascii=False, sort_keys=True)]
+        text = str(value)
+        return [text] if text else []
+
+    @staticmethod
+    def _is_low_information_payload(payload: str) -> bool:
+        text = str(payload or "").strip()
+        if not text:
+            return True
+        if "AAAAAAAA..." in text:
+            return True
+        compact = re.sub(r"\s+", "", text)
+        if len(compact) < 16:
+            return False
+        shell_stripped = re.sub(r"(?i)\b(echo|printf)\b|['\"`]|\.\/harness|[|;&]", "", compact)
+        if re.fullmatch(r"A{16,}", shell_stripped):
+            return True
+        return len(set(compact)) <= 2
+
+    def _payload_plan_is_low_information(self, payload_plan: dict[str, Any]) -> bool:
+        samples: list[str] = []
+        stdin_script = str(payload_plan.get("stdin_script") or "")
+        if stdin_script:
+            samples.append(stdin_script)
+        samples.extend(str(item) for item in payload_plan.get("payloads", []) if str(item))
+        if not samples:
+            return False
+        return all(self._is_low_information_payload(sample) for sample in samples)
+
+    def _plan_has_harness(self, payload_plan: dict[str, Any]) -> bool:
+        return bool(self._extract_harness_code(payload_plan)[0])
+
+    def _replace_low_information_payload(self, payload_plan: dict[str, Any], finding: Finding) -> dict[str, Any]:
+        repaired = dict(payload_plan)
+        repaired["source"] = f"{payload_plan.get('source') or 'llm_payload_planner'}+structured_input"
+        repaired["format"] = "stdin_text"
+        seed = "\n".join(
+            [
+                f"agentic_audit_case={finding.id}",
+                f"target_function={finding.function_name or 'unknown'}",
+                f"source={finding.source or 'stdin'}",
+                f"sink={finding.sink or 'unknown'}",
+                "payload=target_specific_boundary_input",
+            ]
+        )
+        repaired["payloads"] = [seed]
+        repaired["stdin_script"] = seed
+        repaired.setdefault("limitations", [])
+        repaired["limitations"] = self._coerce_text_list(repaired.get("limitations")) + [
+            "LLM payload was low-information and was replaced with structured stdin content."
+        ]
+        return repaired
+
+    @staticmethod
+    def _parse_json_object(content: str) -> dict[str, Any]:
+        text = content.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", text, re.S)
+            if not match:
+                return {}
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _source_excerpt(self, target: Path, finding: Finding) -> str:
+        path = target / finding.file_path if finding.file_path else None
+        if path and path.exists() and path.is_file():
+            try:
+                return path.read_text(encoding="utf-8", errors="replace")[:6000]
+            except OSError:
+                pass
+        return finding.code_snippet[:6000]
 
     def _native_command(self, target: Path, poc_path: Path, native_executable: Path | None = None) -> list[str]:
         exe = native_executable or self._find_native_executable(target)
@@ -2481,7 +3015,7 @@ class DynamicPlanner:
             "Return a JSON array only. Each item must contain finding_id, runtime_type, build_strategy, "
             "poc_strategy, oracle, rationale, and verification_recipe. verification_recipe must contain "
             "target_function, source, sink, preconditions, preferred_build, runtime_entry, fallback_harness, "
-            "micro_proof, expected_signal, and limitations. Choose only values represented by the deterministic "
+            "micro_proof, payloads, payload_format, execution_steps, expected_signal, and limitations. Choose only values represented by the deterministic "
             "plan and detected environment; never claim execution success.\nProject profile:\n"
             + json.dumps(
                 {
@@ -2613,6 +3147,13 @@ class DynamicPlanner:
             "runtime_entry",
             "fallback_harness",
             "micro_proof",
+            "payloads",
+            "payload_format",
+            "stdin_script",
+            "cli_args",
+            "config_files",
+            "harness_code",
+            "execution_steps",
             "oracle",
             "expected_signal",
             "limitations",
@@ -2775,6 +3316,13 @@ class DynamicPlanner:
                 "If target-specific harness compilation is not possible, compile/run a minimal no-network proof that "
                 "exercises the same sink pattern and records limitations."
             ),
+            "payloads": list(finding.exploit_payloads[:5]),
+            "payload_format": "generic_overflow_probe",
+            "stdin_script": "",
+            "cli_args": [],
+            "config_files": [],
+            "harness_code": "",
+            "execution_steps": [],
             "oracle": plan.oracle,
             "expected_signal": plan.oracle,
             "limitations": [
@@ -3001,7 +3549,7 @@ class VerificationAgent:
         self.auto_build_native = auto_build_native
         self.event_sink = event_sink
         self.analyzer = PocAnalyzer(llm_client)
-        self.generator = PocGenerator()
+        self.generator = PocGenerator(llm_client)
         self.checker = EvidenceChecker()
         self.static_verifier = StaticVerifier(llm_client)
         self.dynamic_planner = DynamicPlanner(llm_client)
@@ -3132,7 +3680,7 @@ class VerificationAgent:
                 {"finding_id": finding.id, "runtime_type": environment.runtime_type, "gaps": environment.environment_gaps},
             )
             dynamic_attempted = dynamic_plan.status == "planned"
-            if dynamic_plan.status == "blocked":
+            if dynamic_plan.status == "blocked" and self._should_preserve_block_without_partial(dynamic_plan):
                 outcome = CheckerOutcome(
                     status="blocked",
                     summary=dynamic_plan.rationale,
@@ -3177,6 +3725,14 @@ class VerificationAgent:
                 )
             )
         return results
+
+    @staticmethod
+    def _should_preserve_block_without_partial(dynamic_plan: DynamicVerificationPlan) -> bool:
+        return dynamic_plan.blocked_reason in {
+            "build_disabled",
+            "dynamic_budget_exhausted",
+            "risk_domain_static_only",
+        }
 
     @staticmethod
     def _director_hint_for_finding(finding: Finding, strategy: Any | None) -> dict[str, Any]:

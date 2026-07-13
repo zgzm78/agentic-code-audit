@@ -19,6 +19,8 @@ RUN set -eux; \
     && apt-get install -y --no-install-recommends \
       bash \
       ca-certificates \
+      autoconf \
+      automake \
       clang \
       clang-tidy \
       cmake \
@@ -38,6 +40,9 @@ RUN set -eux; \
       libbrotli-dev \
       libexpat1-dev \
       libinih-dev \
+      libtool \
+      gettext \
+      autopoint \
       zlib1g-dev \
       make \
       maven \
