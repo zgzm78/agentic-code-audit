@@ -31,6 +31,11 @@ DATA_DIR = APP_ROOT / "data"
 REPORTS_DIR = APP_ROOT / "reports"
 STORE = AuditStore(DATA_DIR / "agentic-code-audit.sqlite3")
 
+
+def _sync_imported_reports() -> None:
+    STORE.sync_report_directories(REPORTS_DIR)
+
+
 app = FastAPI(title="Agentic Code Audit API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
@@ -328,6 +333,7 @@ def cancel_task(task_id: str) -> dict[str, Any]:
 
 @app.get("/api/tasks")
 def list_tasks() -> list[dict[str, Any]]:
+    _sync_imported_reports()
     return STORE.list_tasks()
 
 
@@ -346,6 +352,7 @@ def delete_task(task_id: str) -> dict[str, Any]:
 
 @app.get("/api/tasks/{task_id}")
 def get_task(task_id: str) -> dict[str, Any]:
+    _sync_imported_reports()
     task = STORE.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -355,6 +362,7 @@ def get_task(task_id: str) -> dict[str, Any]:
 
 @app.get("/api/tasks/{task_id}/events")
 async def stream_events(task_id: str, after: int = 0):
+    _sync_imported_reports()
     if not STORE.get_task(task_id):
         raise HTTPException(status_code=404, detail="task not found")
 
@@ -378,6 +386,7 @@ async def stream_events(task_id: str, after: int = 0):
 
 @app.get("/api/tasks/{task_id}/events/history")
 def list_events(task_id: str, after: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+    _sync_imported_reports()
     if not STORE.get_task(task_id):
         raise HTTPException(status_code=404, detail="task not found")
     return STORE.get_events(task_id, after, limit)
@@ -385,11 +394,13 @@ def list_events(task_id: str, after: int = 0, limit: int = 500) -> list[dict[str
 
 @app.get("/api/tasks/{task_id}/findings")
 def list_findings(task_id: str) -> list[dict[str, Any]]:
+    _sync_imported_reports()
     return STORE.list_findings(task_id)
 
 
 @app.get("/api/tasks/{task_id}/profile")
 def get_profile(task_id: str) -> dict[str, Any]:
+    _sync_imported_reports()
     if not STORE.get_task(task_id):
         raise HTTPException(status_code=404, detail="task not found")
     profile = STORE.get_project_profile(task_id)
@@ -400,6 +411,7 @@ def get_profile(task_id: str) -> dict[str, Any]:
 
 @app.get("/api/tasks/{task_id}/findings/{finding_id}")
 def get_finding(task_id: str, finding_id: str) -> dict[str, Any]:
+    _sync_imported_reports()
     finding = STORE.get_finding(task_id, finding_id)
     if not finding:
         raise HTTPException(status_code=404, detail="finding not found")
@@ -408,6 +420,7 @@ def get_finding(task_id: str, finding_id: str) -> dict[str, Any]:
 
 @app.get("/api/tasks/{task_id}/report.md")
 def get_report(task_id: str):
+    _sync_imported_reports()
     task = STORE.get_task(task_id)
     if not task or not task.get("markdown_report"):
         raise HTTPException(status_code=404, detail="report not found")
@@ -419,6 +432,7 @@ def get_report(task_id: str):
 
 @app.get("/api/tasks/{task_id}/mining-debug.json")
 def get_mining_debug(task_id: str):
+    _sync_imported_reports()
     task = STORE.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -431,6 +445,7 @@ def get_mining_debug(task_id: str):
 
 @app.get("/api/tasks/{task_id}/report.json")
 def get_json_report(task_id: str):
+    _sync_imported_reports()
     task = STORE.get_task(task_id)
     if not task or not task.get("json_report"):
         raise HTTPException(status_code=404, detail="report not found")

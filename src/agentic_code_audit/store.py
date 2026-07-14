@@ -307,6 +307,81 @@ class AuditStore:
             row = conn.execute("select * from tasks where id=?", (task_id,)).fetchone()
         return self._normalize_task(dict(row)) if row else None
 
+    def sync_report_directories(self, reports_dir: Path) -> int:
+        if not reports_dir.exists() or not reports_dir.is_dir():
+            return 0
+        imported = 0
+        with self.connect() as conn:
+            existing_ids = {
+                str(row["id"])
+                for row in conn.execute("select id from tasks").fetchall()
+            }
+        for report_json in sorted(reports_dir.glob("*/audit-report.json")):
+            task_id = report_json.parent.name
+            if task_id in existing_ids:
+                continue
+            try:
+                payload = json.loads(report_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if self.import_report_directory(task_id, report_json.parent, payload):
+                existing_ids.add(task_id)
+                imported += 1
+        return imported
+
+    def import_report_directory(self, task_id: str, report_dir: Path, payload: dict[str, Any]) -> bool:
+        if not task_id or not payload:
+            return False
+        input_source = payload.get("input_source") if isinstance(payload.get("input_source"), dict) else {}
+        target = str(input_source.get("original") or payload.get("target") or report_dir.name)
+        mode = str(payload.get("mode") or "standard")
+        llm_provider = str(payload.get("llm_provider") or "deepseek")
+        llm_model = str(payload.get("llm_model") or payload.get("model") or "")
+        created_at = str(payload.get("created_at") or utc_now())
+        commit_hash = str(input_source.get("commit") or "")
+        target_type = str(input_source.get("kind") or self._infer_target_type(target))
+        json_path = report_dir / "audit-report.json"
+        markdown_path = report_dir / "audit-report.md"
+        with self._lock, self.connect() as conn:
+            if conn.execute("select 1 from tasks where id=?", (task_id,)).fetchone():
+                return False
+            conn.execute(
+                """
+                insert into tasks(
+                  id,target,mode,model,status,runtime_url,enable_native_build,report_dir,json_report,
+                  markdown_report,error,created_at,started_at,finished_at,target_type,commit_hash,
+                  llm_provider,llm_model,current_agent,current_phase,progress_done,progress_total
+                )
+                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    task_id,
+                    target,
+                    mode,
+                    llm_model,
+                    "completed",
+                    "",
+                    0,
+                    str(report_dir),
+                    str(json_path),
+                    str(markdown_path) if markdown_path.exists() else "",
+                    "",
+                    created_at,
+                    created_at,
+                    created_at,
+                    target_type,
+                    commit_hash,
+                    llm_provider,
+                    llm_model,
+                    "System",
+                    "imported",
+                    1,
+                    1,
+                ),
+            )
+            self._import_report_payload(conn, task_id, payload, json_path, markdown_path)
+        return True
+
     def list_tasks(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute("select * from tasks order by created_at desc").fetchall()
@@ -469,6 +544,165 @@ class AuditStore:
                 ),
             )
 
+    def _import_report_payload(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        payload: dict[str, Any],
+        json_path: Path,
+        markdown_path: Path,
+    ) -> None:
+        for table in (
+            "tool_runs",
+            "dangerous_functions",
+            "program_slices",
+            "candidates",
+            "findings",
+            "verification_attempts",
+            "artifacts",
+            "project_profiles",
+            "agent_events",
+        ):
+            conn.execute(f"delete from {table} where task_id=?", (task_id,))
+
+        profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+        conn.execute(
+            "insert into project_profiles(task_id,data,created_at) values(?,?,?)",
+            (task_id, self._json(profile), utc_now()),
+        )
+
+        for index, item in enumerate(payload.get("tool_results") or []):
+            if not isinstance(item, dict):
+                continue
+            run_id = str(item.get("run_id") or item.get("id") or f"imported-tool-{index}")
+            self._register_imported_artifacts(conn, task_id, item.get("artifact_records") or [])
+            conn.execute(
+                """
+                insert into tool_runs(
+                  task_id,run_id,tool,status,data,command,exit_code,duration_ms,stdout_artifact_id,
+                  stderr_artifact_id,parsed_artifact_id,summary,cache_key,cache_hit,created_at
+                )
+                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    task_id,
+                    run_id,
+                    str(item.get("tool") or "imported"),
+                    str(item.get("status") or ""),
+                    self._json(item),
+                    self._json(item.get("command") or []),
+                    item.get("exit_code"),
+                    item.get("duration_ms"),
+                    str(item.get("stdout_artifact_id") or ""),
+                    str(item.get("stderr_artifact_id") or ""),
+                    str(item.get("parsed_artifact_id") or ""),
+                    str(item.get("summary") or ""),
+                    str(item.get("cache_key") or ""),
+                    int(bool(item.get("cache_hit"))),
+                    str(item.get("finished_at") or item.get("created_at") or utc_now()),
+                ),
+            )
+
+        for index, item in enumerate(payload.get("dangerous_functions") or []):
+            self._insert_imported_item(conn, "dangerous_functions", "item_id", task_id, item, index, "danger")
+        for index, item in enumerate(payload.get("program_slices") or []):
+            self._insert_imported_item(conn, "program_slices", "item_id", task_id, item, index, "slice")
+        for index, item in enumerate(payload.get("candidates") or []):
+            self._insert_imported_item(conn, "candidates", "item_id", task_id, item, index, "candidate")
+
+        for index, item in enumerate(payload.get("findings") or []):
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or f"imported-finding-{index}")
+            conn.execute(
+                "insert into findings(task_id,finding_id,data) values(?,?,?)",
+                (task_id, item_id, self._json(item)),
+            )
+
+        for index, item in enumerate(payload.get("verification_results") or []):
+            if not isinstance(item, dict):
+                continue
+            finding_id = str(item.get("finding_id") or item.get("id") or f"imported-verification-{index}")
+            self._register_imported_artifacts(conn, task_id, item.get("artifact_records") or [])
+            conn.execute(
+                """
+                insert into verification_attempts(
+                  task_id,finding_id,data,strategy,plan,commands,scripts_artifact_ids,exit_code,
+                  stdout_artifact_id,stderr_artifact_id,generated_files,duration_ms,
+                  checker_verdict,checker_reason,environment,environment_gaps,execution,
+                  evidence_artifact_ids,exploit_artifact_ids,checker_details,local_fallback,created_at
+                )
+                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    task_id,
+                    finding_id,
+                    self._json(item),
+                    str(item.get("strategy") or item.get("verification_mode") or item.get("method") or ""),
+                    self._json(item.get("verification_plan") or item.get("verification_recipe") or {}),
+                    self._json([item.get("target_command") or [], item.get("sandbox_command") or []]),
+                    self._json(item.get("artifact_ids") or []),
+                    item.get("exit_code"),
+                    str(item.get("stdout_artifact_id") or ""),
+                    str(item.get("stderr_artifact_id") or ""),
+                    self._json(item.get("generated_artifacts") or []),
+                    item.get("duration_ms"),
+                    str(item.get("checker_status") or item.get("status") or ""),
+                    str(item.get("checker_summary") or item.get("rejection_reason") or ""),
+                    self._json(item.get("environment") or {}),
+                    self._json(item.get("environment_gaps") or []),
+                    self._json(item.get("execution") or {}),
+                    self._json(item.get("evidence_artifact_ids") or []),
+                    self._json(item.get("exploit_artifact_ids") or []),
+                    self._json(item.get("checker_details") or {}),
+                    int(bool(item.get("local_fallback"))),
+                    utc_now(),
+                ),
+            )
+
+        self._insert_artifact(conn, task_id, "json_report", json_path)
+        if markdown_path.exists():
+            self._insert_artifact(conn, task_id, "markdown_report", markdown_path)
+
+        events = payload.get("agent_events") or []
+        if events:
+            for index, item in enumerate(events, start=1):
+                if not isinstance(item, dict):
+                    continue
+                conn.execute(
+                    """
+                    insert into agent_events(task_id,sequence,agent,event_type,message,metadata,created_at,phase)
+                    values(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        task_id,
+                        index,
+                        str(item.get("agent") or "System"),
+                        str(item.get("action") or item.get("event_type") or "imported_event"),
+                        str(item.get("detail") or item.get("message") or "导入历史事件"),
+                        self._json(item.get("metadata") or {}),
+                        str(item.get("started_at") or item.get("created_at") or utc_now()),
+                        str(item.get("phase") or item.get("status") or "imported"),
+                    ),
+                )
+        else:
+            conn.execute(
+                """
+                insert into agent_events(task_id,sequence,agent,event_type,message,metadata,created_at,phase)
+                values(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    task_id,
+                    1,
+                    "System",
+                    "report_imported",
+                    "从 reports 目录导入历史报告",
+                    self._json({"json_report": str(json_path)}),
+                    utc_now(),
+                    "imported",
+                ),
+            )
+
     def list_findings(self, task_id: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute("select finding_id,data from findings where task_id=?", (task_id,)).fetchall()
@@ -588,6 +822,46 @@ class AuditStore:
                 Path(record.path),
                 metadata=record.metadata,
             )
+
+    def _register_imported_artifacts(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        records: list[dict[str, Any]],
+    ) -> None:
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                continue
+            raw_path = str(record.get("path") or "")
+            if not raw_path:
+                continue
+            artifact_id = str(record.get("id") or f"{task_id}-artifact-{index}")
+            self._insert_artifact_with_id(
+                conn,
+                task_id,
+                artifact_id,
+                str(record.get("kind") or "imported_artifact"),
+                Path(raw_path),
+                metadata=record.get("metadata") if isinstance(record.get("metadata"), dict) else {"name": Path(raw_path).name},
+            )
+
+    def _insert_imported_item(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        id_column: str,
+        task_id: str,
+        item: Any,
+        index: int,
+        prefix: str,
+    ) -> None:
+        if not isinstance(item, dict):
+            return
+        item_id = str(item.get("id") or item.get("run_id") or f"imported-{prefix}-{index}")
+        conn.execute(
+            f"insert into {table}(task_id,{id_column},data) values(?,?,?)",
+            (task_id, item_id, self._json(item)),
+        )
 
     def _build_trace(
         self,

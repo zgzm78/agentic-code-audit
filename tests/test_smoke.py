@@ -1523,6 +1523,73 @@ def test_save_report_registers_artifacts_and_finding_trace(tmp_path: Path):
     assert store.get_artifact("verify-1") is not None
 
 
+def test_store_syncs_copied_report_directory_into_task_history(tmp_path: Path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    reports_dir = tmp_path / "reports"
+    report_dir = reports_dir / "imported-task"
+    report_dir.mkdir(parents=True)
+    (report_dir / "audit-report.md").write_text("# imported\n", encoding="utf-8")
+    (report_dir / "audit-report.json").write_text(
+        json.dumps(
+            {
+                "input_source": {
+                    "original": "https://github.com/example/project",
+                    "kind": "git",
+                    "local_path": "/app/runs/repos/imported",
+                    "commit": "abc123",
+                },
+                "target": "/app/runs/repos/imported",
+                "created_at": "2026-07-14T00:00:00+00:00",
+                "mode": "deep",
+                "llm_provider": "openai-compatible",
+                "llm_model": "test-model",
+                "profile": {"root": "/app/runs/repos/imported", "project_type": "cli"},
+                "tool_results": [],
+                "dangerous_functions": [],
+                "program_slices": [],
+                "candidates": [],
+                "findings": [
+                    {
+                        "id": "finding-1",
+                        "title": "imported finding",
+                        "severity": "high",
+                        "vulnerability_type": "command_injection",
+                        "file_path": "app.py",
+                        "line_start": 12,
+                    }
+                ],
+                "verification_results": [
+                    {
+                        "finding_id": "finding-1",
+                        "status": "partial_dynamic_proof",
+                        "method": "imported",
+                        "proof_level": "micro_proof",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert store.sync_report_directories(reports_dir) == 1
+    assert store.sync_report_directories(reports_dir) == 0
+
+    tasks = store.list_tasks()
+    assert tasks[0]["id"] == "imported-task"
+    assert tasks[0]["target"] == "https://github.com/example/project"
+    assert tasks[0]["status"] == "completed"
+    assert tasks[0]["report_dir"] == str(report_dir)
+    assert tasks[0]["json_report"] == str(report_dir / "audit-report.json")
+    assert tasks[0]["commit"] == "abc123"
+
+    findings = store.list_findings("imported-task")
+    assert len(findings) == 1
+    assert findings[0]["title"] == "imported finding"
+    assert findings[0]["verification"]["status"] == "partial_dynamic_proof"
+    assert store.get_project_profile("imported-task")["project_type"] == "cli"
+
+
 def test_report_writer_outputs_chinese_trace_and_verification_sections(tmp_path: Path):
     report = AuditReport(
         input_source=InputSource(original="examples/vulnerable-python", kind="local", local_path="examples/vulnerable-python"),
