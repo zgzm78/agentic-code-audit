@@ -21,7 +21,7 @@ function statusDot(status: string) {
 }
 
 export default function Sidebar({ tasks, selectedTaskId, statusText, onCreateTask, onSelectTask, onDeleteTask }: Props) {
-  const [target, setTarget] = useState("https://github.com/Exiv2/exiv2.git");
+  const [target, setTarget] = useState("https://github.com/Exiv2/exiv2");
   const [runtimeUrl, setRuntimeUrl] = useState("");
   const [mode, setMode] = useState("standard");
   const [enableNativeBuild, setEnableNativeBuild] = useState(false);
