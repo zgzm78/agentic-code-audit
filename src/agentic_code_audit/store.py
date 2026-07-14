@@ -718,7 +718,7 @@ class AuditStore:
             finding["verification"] = verification
             if verification and not finding.get("verification_status"):
                 finding["verification_status"] = verification.get("status", "not_verified")
-            finding["trace"] = self._build_trace(task_id, finding, include_objects=False)
+            finding["trace"] = self._trace_summary(finding)
             output.append(finding)
         return output
 
@@ -910,6 +910,15 @@ class AuditStore:
             "dangerous_function_id": dangerous_function_id,
             "tool_run_refs": tool_run_refs,
             "artifact_refs": artifact_refs,
+        }
+
+    def _trace_summary(self, finding: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "candidate_id": str(finding.get("candidate_id") or ""),
+            "slice_id": str(finding.get("slice_id") or ""),
+            "dangerous_function_id": str(finding.get("dangerous_function_id") or ""),
+            "tool_run_refs": [str(item) for item in finding.get("tool_run_refs") or [] if item],
+            "artifact_refs": [str(item) for item in finding.get("artifact_refs") or [] if item],
         }
 
     def _read_item(
