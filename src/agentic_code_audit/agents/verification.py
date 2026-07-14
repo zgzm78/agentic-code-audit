@@ -2631,10 +2631,10 @@ class VerificationPlanner:
         except OSError:
             source_excerpt = finding.code_snippet[:4000]
         payload = finding.exploit_payloads[0] if finding.exploit_payloads else "A" * 256
-        marker = self._marker_for(finding)
+        finding_json = json.dumps(finding.__dict__, ensure_ascii=False, default=str)
         script = f'''import json
 
-finding = {json.dumps(finding.__dict__, ensure_ascii=False, default=str)}
+finding = json.loads({finding_json!r})
 source_excerpt = {source_excerpt!r}
 payload = {payload!r}
 
@@ -2648,7 +2648,7 @@ has_sink = bool(sink and sink in snippet) or finding.get("vulnerability_type") i
 has_trigger = bool(finding.get("trigger_conditions") or finding.get("source") or finding.get("exploit_payloads"))
 
 if has_sink and has_trigger:
-    print("{marker}")
+    print("[EVIDENCE] source, sink, and trigger metadata recorded")
 else:
     print("[INFO] harness did not prove triggerability")
 '''
@@ -2657,13 +2657,13 @@ else:
             language="python",
             script=script,
             command=["python", "/workspace/harness.py"],
-            oracle=f"{marker} in stdout",
-            explanation="Generated fallback harness records source/sink/payload evidence without external access.",
+            oracle="metadata capture only; no vulnerability oracle",
+            explanation="Generated fallback records source/sink/payload metadata without executing target code.",
             strategy="local_harness",
             runtime_type="library_harness",
             rationale="No direct service/CLI entry was available.",
             commands=[["python", "/workspace/harness.py"]],
-            expected_signal=marker,
+            expected_signal="[EVIDENCE] metadata captured",
             fallbacks=["weak_static_proof"],
             environment_requirements=["python"],
             mock_strategy="No network; synthetic source/sink trigger only.",

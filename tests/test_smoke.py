@@ -2818,6 +2818,32 @@ def test_phase8_verification_planner_uses_llm_recipe_harness(tmp_path: Path):
     assert harness.command == ["sh", "/workspace/harness.sh"]
 
 
+def test_phase8_fallback_harness_executes_json_values_safely(tmp_path: Path):
+    finding = _phase5_finding("command_injection", "missing.php")
+    finding.line_end = None
+    finding.verification_hint = {"enabled": True, "optional": None}
+    finding.code_snippet = "os.system(request.args)"
+
+    harness = VerificationPlanner().plan(finding, tmp_path)
+    harness_path = tmp_path / "harness.py"
+    harness_path.write_text(harness.script, encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, str(harness_path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "[HARNESS] finding finding-command_injection" in completed.stdout
+    assert "[EVIDENCE] source, sink, and trigger metadata recorded" in completed.stdout
+    assert "[DETECTED]" not in completed.stdout
+    assert "NameError" not in completed.stderr
+
+
 def test_phase8_environment_enables_php_java_go_harness_runtime(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(EnvironmentManager, "_sandbox_reachable", staticmethod(lambda _container="agentic-code-audit-sandbox": False))
     monkeypatch.setattr("agentic_code_audit.agents.verification.shutil.which", lambda tool: f"/usr/bin/{tool}")
