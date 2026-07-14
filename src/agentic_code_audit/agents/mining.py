@@ -2123,19 +2123,103 @@ Source: {program_slice.source}
 
     def _chain_graph(self, candidate: VulnerabilityCandidate, program_slice: ProgramSlice, vuln_type: str) -> ChainGraph:
         effect_label, effect_detail = self._effect_for(vuln_type, program_slice)
-        nodes = [
-            ChainNode("source", program_slice.source or "unknown input", "source", program_slice.file_path, program_slice.line_start),
-            ChainNode("function", program_slice.function_name or program_slice.file_path, "function", program_slice.file_path, program_slice.line_start),
-            ChainNode("condition", "trigger condition", "condition", detail="; ".join(candidate.trigger_conditions) or "reachability inferred from slice"),
-            ChainNode("sink", program_slice.sink or vuln_type, "sink", program_slice.file_path, program_slice.line_start),
-            ChainNode("effect", effect_label, "effect", detail=effect_detail),
+        nodes: list[ChainNode] = []
+        edges: list[ChainEdge] = []
+        seen_labels: set[tuple[str, str]] = set()
+
+        def add_node(
+            node_id: str,
+            label: str,
+            node_type: str,
+            file_path: str = "",
+            line: int | None = None,
+            detail: str = "",
+        ) -> str:
+            cleaned_label = (label or "").strip()
+            if not cleaned_label:
+                cleaned_label = node_type
+            key = (node_type, cleaned_label)
+            if key in seen_labels:
+                for node in nodes:
+                    if node.type == node_type and node.label == cleaned_label:
+                        return node.id
+            seen_labels.add(key)
+            safe_id = re.sub(r"[^a-zA-Z0-9_]+", "_", node_id).strip("_") or f"node_{len(nodes)}"
+            if any(node.id == safe_id for node in nodes):
+                safe_id = f"{safe_id}_{len(nodes)}"
+            nodes.append(ChainNode(safe_id, cleaned_label, node_type, file_path, line, detail))
+            return safe_id
+
+        def connect(source: str, target: str, edge_type: str, label: str) -> None:
+            if source == target:
+                return
+            edge_key = (source, target, edge_type, label)
+            if any((edge.source, edge.target, edge.type, edge.label) == edge_key for edge in edges):
+                return
+            edges.append(ChainEdge(source, target, edge_type, label))
+
+        source_label = program_slice.source or "unknown input"
+        source_id = add_node("source", source_label, "source", program_slice.file_path, program_slice.line_start)
+        previous_id = source_id
+
+        call_items = [item for item in program_slice.call_chain if item]
+        if program_slice.function_name and program_slice.function_name not in call_items:
+            call_items.append(program_slice.function_name)
+        for index, item in enumerate(call_items):
+            if item == source_label or item == program_slice.sink:
+                continue
+            node_id = add_node(
+                f"call_{index}",
+                item,
+                "function",
+                program_slice.file_path,
+                program_slice.line_start if item == program_slice.function_name else None,
+                "call chain evidence",
+            )
+            connect(previous_id, node_id, "inferred_call", "call path")
+            previous_id = node_id
+
+        data_flow_items = [
+            item
+            for item in program_slice.data_flow
+            if item and item not in {source_label, program_slice.sink, program_slice.function_name}
         ]
-        edges = [
-            ChainEdge("source", "function", "passes_data", "input reaches function"),
-            ChainEdge("function", "condition", "guards", "function-level controls"),
-            ChainEdge("condition", "sink", "reaches", "trigger path reaches sink"),
-            ChainEdge("sink", "effect", "triggers", "security impact"),
-        ]
+        for index, item in enumerate(data_flow_items[:6]):
+            node_id = add_node(f"data_flow_{index}", item, "data_flow", detail="data-flow evidence")
+            connect(previous_id, node_id, "inferred_data_flow", "data flow")
+            previous_id = node_id
+
+        if candidate.trigger_conditions:
+            condition_id = add_node(
+                "condition",
+                "trigger condition",
+                "condition",
+                detail="; ".join(candidate.trigger_conditions),
+            )
+            connect(previous_id, condition_id, "trigger_condition", "requires")
+            previous_id = condition_id
+
+        for index, guard in enumerate(program_slice.guards[:4]):
+            guard_id = add_node(f"guard_{index}", guard, "guard", program_slice.file_path, program_slice.line_start)
+            connect(previous_id, guard_id, "control", "guard observed")
+            previous_id = guard_id
+
+        for index, missing_guard in enumerate(program_slice.missing_guards[:4]):
+            guard_id = add_node(
+                f"missing_guard_{index}",
+                missing_guard,
+                "missing_guard",
+                program_slice.file_path,
+                program_slice.line_start,
+                "required control was not proven in the slice",
+            )
+            connect(previous_id, guard_id, "missing_control", "missing guard")
+            previous_id = guard_id
+
+        sink_id = add_node("sink", program_slice.sink or vuln_type, "sink", program_slice.file_path, program_slice.line_start)
+        connect(previous_id, sink_id, "reaches", "reaches sink")
+        effect_id = add_node("effect", effect_label, "effect", detail=effect_detail)
+        connect(sink_id, effect_id, "triggers", "security impact")
         return ChainGraph(nodes=nodes, edges=edges)
 
     def _effect_for(self, vuln_type: str, program_slice: ProgramSlice) -> tuple[str, str]:

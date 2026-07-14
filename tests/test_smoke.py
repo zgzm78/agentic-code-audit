@@ -1302,6 +1302,11 @@ def test_classifier_adds_non_empty_effect_to_chain_graph():
     assert effect_nodes
     assert effect_nodes[0].label
     assert effect_nodes[0].detail
+    assert len(findings[0].chain_graph.nodes) > 5
+    node_labels = [node.label for node in findings[0].chain_graph.nodes]
+    assert "GET /ping" in node_labels
+    assert "input validation" in node_labels
+    assert any(edge.type == "missing_control" for edge in findings[0].chain_graph.edges)
     assert findings[0].severity == "critical"
     assert findings[0].should_verify is True
     assert findings[0].tool_run_refs == ["run-1", "run-2"]
