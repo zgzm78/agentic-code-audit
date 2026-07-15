@@ -129,7 +129,7 @@ function ShutdownDialog({ phase, running, error, onClose, onConfirm }: {
 }
 
 function TaskForm({ onSubmit }: { onSubmit: (payload: Record<string, unknown>) => Promise<void> }) {
-  const [target, setTarget] = useState("https://github.com/Exiv2/exiv2");
+  const [target, setTarget] = useState("");
   const [mode, setMode] = useState("standard");
   const [runtime, setRuntime] = useState("");
   const [native, setNative] = useState(false);
