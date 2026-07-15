@@ -29,23 +29,42 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export function createAbortController() {
+  return new AbortController();
+}
+
+function query(path: string, params: Record<string, string | number>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") search.set(key, String(value));
+  }
+  const qs = search.toString();
+  return qs ? `${path}?${qs}` : path;
+}
+
 export const api = {
-  health: () => request<Record<string, unknown>>("/api/health"),
-  tools: () => request<ToolInfo[]>("/api/tools"),
-  tasks: () => request<Task[]>("/api/tasks"),
-  task: (id: string) => request<Task>(`/api/tasks/${id}`),
-  events: (id: string) => request<any[]>(`/api/tasks/${id}/events/history`),
-  profile: (id: string) => request<ProjectProfile>(`/api/tasks/${id}/profile`),
-  miningDebug: (id: string) => request<MiningDebug>(`/api/tasks/${id}/mining-debug.json`),
-  finding: (taskId: string, findingId: string) => request<any>(`/api/tasks/${taskId}/findings/${findingId}`),
+  health: (signal?: AbortSignal) => request<Record<string, unknown>>("/api/health", signal ? { signal } : undefined),
+  tools: (signal?: AbortSignal) => request<ToolInfo[]>("/api/tools", signal ? { signal } : undefined),
+  tasks: (signal?: AbortSignal) => request<Task[]>("/api/tasks", signal ? { signal } : undefined),
+  task: (id: string, signal?: AbortSignal) => request<Task>(`/api/tasks/${id}`, signal ? { signal } : undefined),
+  events: (id: string, after?: number, signal?: AbortSignal) =>
+    request<any[]>(query(`/api/tasks/${id}/events/history`, { after: after ?? 0 }), signal ? { signal } : undefined),
+  profile: (id: string, signal?: AbortSignal) => request<ProjectProfile>(`/api/tasks/${id}/profile`, signal ? { signal } : undefined),
+  miningDebug: (id: string, signal?: AbortSignal) => request<MiningDebug>(`/api/tasks/${id}/mining-debug.json`, signal ? { signal } : undefined),
+  finding: (taskId: string, findingId: string, signal?: AbortSignal) =>
+    request<any>(`/api/tasks/${taskId}/findings/${findingId}`, signal ? { signal } : undefined),
   createTask: (payload: Record<string, unknown>) => request<{ task_id: string }>("/api/tasks", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
   }),
-  startTask: (id: string) => request(`/api/tasks/${id}/start`, { method: "POST" }),
-  cancelTask: (id: string) => request(`/api/tasks/${id}/cancel`, { method: "POST" }),
+  startTask: (id: string, signal?: AbortSignal) => request(`/api/tasks/${id}/start`, {
+    method: "POST", signal,
+  }),
+  cancelTask: (id: string, signal?: AbortSignal) => request(`/api/tasks/${id}/cancel`, {
+    method: "POST", signal,
+  }),
   deleteTask: (id: string) => request(`/api/tasks/${id}`, { method: "DELETE" }),
-  report: async (id: string) => {
-    const response = await fetch(`${API_BASE}/api/tasks/${id}/report.md`);
+  report: async (id: string, signal?: AbortSignal) => {
+    const response = await fetch(`${API_BASE}/api/tasks/${id}/report.md`, signal ? { signal } : undefined);
     return response.ok ? response.text() : "";
   },
   llmSettings: () => request<LLMSettings>("/api/settings/llm"),

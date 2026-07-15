@@ -1,7 +1,7 @@
 import { lazy, startTransition, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { AnimatePresence, motion } from "motion/react";
-import { api, API_BASE } from "./api/client";
+import { api, API_BASE, createAbortController } from "./api/client";
 import type { EventItem, Finding, MiningDebug, ProjectProfile, Task, ToolInfo } from "./components/types";
 import AppShell from "./features/shell/AppShell";
 
@@ -57,6 +57,7 @@ export default function App() {
   const reportLoadedRef = useRef(new Set<string>());
   const detailRefreshAtRef = useRef(new Map<string, number>());
   const terminalDetailsLoadedRef = useRef(new Set<string>());
+  const selectAbortRef = useRef<AbortController>();
 
   const refreshTasks = useCallback(async () => {
     const tasks = await api.tasks();
@@ -65,21 +66,25 @@ export default function App() {
   }, []);
 
   const selectTask = useCallback(async (id: string) => {
+    selectAbortRef.current?.abort();
+    const controller = createAbortController();
+    selectAbortRef.current = controller;
+    const { signal } = controller;
     const startedAt = performance.now();
     selectedTaskRef.current = id;
     setData((prev) => ({ ...prev, busy: true, notice: "正在组装调查证据" }));
     try {
       const [task, events, profile, debug, report] = await Promise.all([
-        api.task(id),
-        api.events(id).catch(() => []),
-        api.profile(id).catch(() => null),
-        api.miningDebug(id).catch(() => null),
-        api.report(id).catch(() => ""),
+        api.task(id, signal),
+        api.events(id, 0, signal).catch(() => [] as any[]),
+        api.profile(id, signal).catch(() => null),
+        api.miningDebug(id, signal).catch(() => null),
+        api.report(id, signal).catch(() => ""),
       ]);
-      if (selectedTaskRef.current !== id) return;
+      if (signal.aborted || selectedTaskRef.current !== id) return;
       const remaining = MINIMUM_ASSEMBLY_MS - (performance.now() - startedAt);
       if (remaining > 0) await wait(remaining);
-      if (selectedTaskRef.current !== id) return;
+      if (signal.aborted || selectedTaskRef.current !== id) return;
       if (report) reportLoadedRef.current.add(id);
       detailRefreshAtRef.current.set(id, performance.now());
       if (TERMINAL.has(task.status)) terminalDetailsLoadedRef.current.add(id);
@@ -97,11 +102,13 @@ export default function App() {
         notice: "",
       }));
     } catch (error) {
-      if (selectedTaskRef.current === id) {
+      if (!signal.aborted && selectedTaskRef.current === id) {
         setData((prev) => ({ ...prev, busy: false, notice: (error as Error).message }));
       }
     }
   }, []);
+
+  const afterRef = useRef(0);
 
   const refreshSelectedTask = useCallback(async (id: string) => {
     if (selectedTaskRef.current !== id || syncInFlightRef.current === id) return;
@@ -112,7 +119,8 @@ export default function App() {
       const detailsPromise = shouldRefreshDetails
         ? Promise.all([api.profile(id).catch(() => null), api.miningDebug(id).catch(() => null)])
         : Promise.resolve<[ProjectProfile | null | undefined, MiningDebug | null | undefined]>([undefined, undefined]);
-      const [task, events, initialDetails] = await Promise.all([api.task(id), api.events(id).catch(() => []), detailsPromise]);
+      const after = afterRef.current;
+      const [task, events, initialDetails] = await Promise.all([api.task(id), api.events(id, after).catch(() => []), detailsPromise]);
       let [profile, debug] = initialDetails;
       if (shouldRefreshDetails) detailRefreshAtRef.current.set(id, now);
       if (TERMINAL.has(task.status) && !terminalDetailsLoadedRef.current.has(id)) {
@@ -128,16 +136,20 @@ export default function App() {
         if (report) reportLoadedRef.current.add(id);
       }
       if (selectedTaskRef.current !== id) return;
-      startTransition(() => setData((prev) => ({
-        ...prev,
-        task,
-        events: mergeEvents(prev.events, events),
-        findings: task.findings ?? prev.findings,
-        profile: profile === undefined ? prev.profile : profile,
-        debug: debug === undefined ? prev.debug : debug,
-        report: report === undefined ? prev.report : report,
-        tasks: prev.tasks.map((item) => item.id === task.id ? { ...item, ...task } : item),
-      })));
+      startTransition(() => setData((prev) => {
+        const merged = mergeEvents(prev.events, events);
+        afterRef.current = merged.reduce((max, e) => Math.max(max, e.sequence), 0);
+        return {
+          ...prev,
+          task,
+          events: merged,
+          findings: task.findings ?? prev.findings,
+          profile: profile === undefined ? prev.profile : profile,
+          debug: debug === undefined ? prev.debug : debug,
+          report: report === undefined ? prev.report : report,
+          tasks: prev.tasks.map((item) => item.id === task.id ? { ...item, ...task } : item),
+        };
+      }));
     } finally {
       if (syncInFlightRef.current === id) syncInFlightRef.current = undefined;
     }

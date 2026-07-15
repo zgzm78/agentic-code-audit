@@ -44,7 +44,6 @@ type Props = {
   progressFailed: boolean;
   onStartTask: () => void;
   onStopTask: () => void;
-  onSelectFinding: (f: Finding) => void;
   onOpenFindingDetail: (f: Finding) => void;
 };
 

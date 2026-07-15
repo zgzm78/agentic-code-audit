@@ -3,7 +3,7 @@ name = "agentic-code-audit"
 version = "0.1.0"
 description = "Agentic source code security audit and verification system."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
   { name = "agentic-code-audit contributors" }
 ]
@@ -35,7 +35,7 @@ packages = ["src/agentic_code_audit"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

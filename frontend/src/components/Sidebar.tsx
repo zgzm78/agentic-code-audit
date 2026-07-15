@@ -11,8 +11,6 @@ type Props = {
   onDeleteTask: (taskId: string, status: string) => void;
 };
 
-const API = (import.meta as any).env?.VITE_API_BASE_URL || "";
-
 function statusDot(status: string) {
   if (status === "completed") return "dot-completed";
   if (status === "running") return "dot-running";
