@@ -187,6 +187,7 @@ def test_system_shutdown_cancels_tasks_and_schedules_compose_stop(tmp_path: Path
 
 
 def test_cli_rejects_missing_deepseek_key(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "")
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     code = cli_main(["audit", "examples/vulnerable-python", "--project-dir", str(tmp_path)])

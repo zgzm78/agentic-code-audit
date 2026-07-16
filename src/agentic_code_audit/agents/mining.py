@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1265,6 +1266,7 @@ class CandidateGenerator:
         self.normalizer = normalizer or VulnerabilityTypeNormalizer()
         self.reviewer = LLMCandidateReviewer(llm_client) if llm_client else None
         self.llm_calls_used = 0
+        self._llm_calls_lock = threading.Lock()
 
     def generate(
         self,
@@ -1341,17 +1343,26 @@ class CandidateGenerator:
                     candidates.append(candidate)
 
         # LLM quality gate — review suspicious candidates (tool-based + low-confidence rule-based)
-        if self.reviewer and self.llm_calls_used < max_llm_calls:
-            self.reviewer.max_llm_calls = max_llm_calls - self.llm_calls_used
+        if self.reviewer and self._llm_calls() < max_llm_calls:
+            self.reviewer.max_llm_calls = max_llm_calls - self._llm_calls()
             candidates = self.reviewer.review_batch(candidates, llm_client)
-            self.llm_calls_used += self.reviewer.llm_calls_used
+            with self._llm_calls_lock:
+                self.llm_calls_used += self.reviewer.llm_calls_used
 
         return candidates[:max_candidates]
+
+    def _inc_llm_calls(self) -> None:
+        with self._llm_calls_lock:
+            self.llm_calls_used += 1
+
+    def _llm_calls(self) -> int:
+        with self._llm_calls_lock:
+            return self.llm_calls_used
 
     def _ask_llm_batch(self, slices: list[ProgramSlice], llm_client: DeepSeekClient) -> list[dict[str, Any]]:
         if not hasattr(llm_client, "chat"):
             return []
-        self.llm_calls_used += 1
+        self._inc_llm_calls()
         prompt = (
             "Return a JSON array of vulnerability candidates. Each item must map to the corresponding slice index and "
             "include file, function, line, sink, trigger_condition, title, vulnerability_type, severity, description, "
