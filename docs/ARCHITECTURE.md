@@ -69,7 +69,7 @@ SQLite 表：
 ## Agent 分层
 
 - `Input/Recon`: 解析目标、clone 仓库、生成项目画像。
-- `Tool`: 调用 Semgrep、Gitleaks、OSV-Scanner、Bandit、npm audit 和内置规则。
+- `Tool`: 调用 Semgrep、Gitleaks、OSV-Scanner、Bandit、npm audit、Trivy 和内置规则。
 - `VulnerabilityMining`: 漏洞挖掘智能体，内部包含危险函数定位、切片分析、候选生成、线索汇聚、漏洞类型判定。
 - `Verification`: 由 DeepSeek 设计 harness/PoC，在 sandbox 执行并保存证据。
 - `Report`: 生成 Markdown/JSON 报告。

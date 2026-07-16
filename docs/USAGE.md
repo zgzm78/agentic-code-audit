@@ -82,6 +82,7 @@ agentic-code-audit audit .\examples\vulnerable-python -o reports\demo --runtime-
 - OSV-Scanner
 - Bandit
 - npm audit
+- Trivy
 - 内置危险函数规则
 
 安装到仓库本地 `.tools/`：

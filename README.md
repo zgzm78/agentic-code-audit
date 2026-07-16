@@ -116,7 +116,7 @@ agentic-code-audit audit .\examples\vulnerable-python -o reports\demo --runtime-
 
 常见工具包括：
 
-- backend/通用工具：`semgrep`、`bandit`、`gitleaks`、`osv-scanner`、`npm audit` 等。
+- backend/通用工具：`semgrep`、`bandit`、`gitleaks`、`osv-scanner`、`npm audit`、`trivy` 等。
 - sandbox/验证工具：`cppcheck`、`clang-tidy`、`ctags`、`cmake`、`make`、`gcc/g++`、`clang/clang++`、`python/pytest`、`node/npm`、`go`、`java/maven/gradle`、`php/composer` 等。
 
 可选安装本地工具到仓库内 `.tools/`：

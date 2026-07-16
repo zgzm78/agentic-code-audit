@@ -187,10 +187,10 @@
 
 阶段二必须完成核心工具安装闭环，而不是只写 registry：
 
-- 更新 `scripts/install_tools.ps1`，安装/检查 `rg`、`semgrep`、`gitleaks`、`osv-scanner`、`bandit`；`npm audit` 依赖 Node/npm，脚本中只做版本检查。
-- 更新 `docker/sandbox/Dockerfile`，安装/检查 `ripgrep`、`semgrep`、`gitleaks`、`osv-scanner`、`bandit`、Node/npm。
-- 更新 `ToolRegistry`，将上述工具标为阶段二核心工具，其中 `rg`、`semgrep`、`gitleaks`、`osv-scanner` 为 required，语言专项工具按项目语言推荐。
-- 更新 `ToolParsers`，确保 Semgrep/Gitleaks/OSV/Bandit/npm audit 输出可结构化解析。
+- 更新 `scripts/install_tools.ps1`，安装/检查 `rg`、`semgrep`、`gitleaks`、`osv-scanner`、`bandit`、`trivy`；`npm audit` 依赖 Node/npm，脚本中只做版本检查。
+- 更新 `docker/sandbox/Dockerfile`，安装/检查 `ripgrep`、`semgrep`、`gitleaks`、`osv-scanner`、`bandit`、`trivy`、Node/npm。
+- 更新 `ToolRegistry`，将上述工具标为阶段二核心工具，其中 `rg`、`semgrep`、`gitleaks`、`osv-scanner`、`trivy` 为 required，语言专项工具按项目语言推荐。
+- 更新 `ToolParsers`，确保 Semgrep/Gitleaks/OSV/Bandit/npm audit/trivy 输出可结构化解析。
 - 增加测试：核心工具可用性检测、工具缺失状态、parser、cache、artifact 保存。
 
 阶段二不安装 `CodeQL`、`Joern`、`AFL++`、`libFuzzer` 这类重型工具，只在 registry 中保留 optional 检测项。
@@ -235,7 +235,7 @@ LLM 使用方式：
 
 阶段三以项目画像为主，不强制安装重型分析工具，但必须为下一阶段漏洞挖掘准备静态工具接入点：
 
-- `ToolRegistry` 增加/确认 `cppcheck`、`clang-tidy`、`pip-audit`、`gosec`、`cargo-audit`、`CodeQL`、`Joern` 的 optional 状态和能力标签。
+- `ToolRegistry` 增加/确认 `cppcheck`、`clang-tidy`、`pip-audit`、`gosec`、`cargo-audit`、`trivy`、`CodeQL`、`Joern` 的 optional 状态和能力标签。
 - `scripts/install_tools.ps1` 可以先安装轻量工具：`cppcheck`、`pip-audit`、`cargo-audit`；`clang-tidy` 依赖 LLVM，可先做检测和安装说明。
 - `docker/sandbox/Dockerfile` 可安装轻量工具和运行时依赖，但 `CodeQL`、`Joern` 仍建议 optional。
 - Recon 的 `recommended_tools` 必须根据语言输出这些工具是否建议使用，以及当前是否 available。
@@ -316,10 +316,9 @@ C/C++ 额外尝试：
 
 阶段四引入的工具必须同步完成安装/检测闭环：
 
-- 更新 `scripts/install_tools.ps1`：补 `cppcheck`、`pip-audit`、`cargo-audit`、`gosec` 的安装或清晰安装提示；`clang-tidy` 优先检测 LLVM 安装状态。
-- 更新 `docker/sandbox/Dockerfile`：补 `cppcheck`、`clang-tidy`、`pip-audit`、Go/Rust 基础工具中可稳定安装的部分。
-- `CodeQL`、`Joern` 在阶段四先作为 optional；只有实现对应 query/CPG 调用、缓存和资源限制后，才改为推荐安装。
-- 更新 `ToolParsers`：cppcheck XML/文本、pip-audit JSON、cargo-audit JSON、gosec JSON。
+- 更新 `scripts/install_tools.ps1`：补 `cppcheck`、`pip-audit`、`cargo-audit`、`gosec`、`trivy` 的安装或清晰安装提示；`clang-tidy` 优先检测 LLVM 安装状态。
+- 更新 `docker/sandbox/Dockerfile`：补 `cppcheck`、`clang-tidy`、`pip-audit`、`trivy`、Go/Rust 基础工具中可稳定安装的部分。
+- 更新 `ToolParsers`：cppcheck XML/文本、pip-audit JSON、cargo-audit JSON、gosec JSON、trivy JSON。
 - 缺失 optional 工具时不能阻塞挖掘，但 finding/candidate 要记录该工具未运行的原因。
 
 #### 4.2.3 排序
