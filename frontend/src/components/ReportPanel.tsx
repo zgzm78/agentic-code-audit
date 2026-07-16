@@ -1,8 +1,7 @@
 import { Download } from "lucide-react";
+import { API_BASE } from "../api/client";
 import type { Task, Finding } from "./types";
 import { orderedRiskGroups, riskDomainOf } from "./riskDomain";
-
-const API = (import.meta as any).env?.VITE_API_BASE_URL || "";
 
 type Props = {
   task: Task | null;
@@ -25,13 +24,13 @@ export default function ReportPanel({ task, findings, report }: Props) {
   return (
     <div>
       <div className="report-actions">
-        <a className="btn btn-ghost btn-sm" href={task ? `${API}/api/tasks/${task.id}/report.md` : "#"} target="_blank" rel="noreferrer">
+        <a className="btn btn-ghost btn-sm" href={task ? `${API_BASE}/api/tasks/${task.id}/report.md` : "#"} target="_blank" rel="noreferrer">
           <Download size={14} /> Markdown
         </a>
-        <a className="btn btn-ghost btn-sm" href={task ? `${API}/api/tasks/${task.id}/report.json` : "#"} target="_blank" rel="noreferrer">
+        <a className="btn btn-ghost btn-sm" href={task ? `${API_BASE}/api/tasks/${task.id}/report.json` : "#"} target="_blank" rel="noreferrer">
           <Download size={14} /> JSON
         </a>
-        <a className="btn btn-ghost btn-sm" href={task ? `${API}/api/tasks/${task.id}/mining-debug.json` : "#"} target="_blank" rel="noreferrer">
+        <a className="btn btn-ghost btn-sm" href={task ? `${API_BASE}/api/tasks/${task.id}/mining-debug.json` : "#"} target="_blank" rel="noreferrer">
           <Download size={14} /> Mining Debug
         </a>
       </div>

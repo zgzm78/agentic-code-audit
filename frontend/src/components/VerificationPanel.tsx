@@ -1,9 +1,8 @@
 import { Download, FlaskConical, PlayCircle, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
+import { API_BASE } from "../api/client";
 import type { ArtifactInfo, ValidationTag, VerificationInfo } from "./types";
 import { validationTags } from "./verificationTags";
-
-const API = (import.meta as any).env?.VITE_API_BASE_URL || "";
 
 type Props = { verification?: VerificationInfo | null };
 
@@ -218,7 +217,7 @@ function ArtifactLinks({ ids, artifacts }: { ids: string[]; artifacts: ArtifactI
       <h4>Artifacts</h4>
       <div className="artifact-list">
         {items.map((a) => (
-          <a key={a.id} href={`${API}/api/artifacts/${a.id}`} target="_blank" rel="noreferrer" className="artifact-link">
+          <a key={a.id} href={`${API_BASE}/api/artifacts/${a.id}`} target="_blank" rel="noreferrer" className="artifact-link">
             <Download size={13} />
             <span>{a.kind || "artifact"}</span>
             <strong>{a.id}</strong>

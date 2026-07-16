@@ -72,6 +72,7 @@ export default function App() {
     const { signal } = controller;
     const startedAt = performance.now();
     selectedTaskRef.current = id;
+    afterRef.current = 0;
     setData((prev) => ({ ...prev, busy: true, notice: "正在组装调查证据" }));
     try {
       const [task, events, profile, debug, report] = await Promise.all([

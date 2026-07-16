@@ -6,11 +6,11 @@ import {
   GitBranch,
   Play,
   Radio,
-  ShieldCheck,
   Square,
   Terminal,
   Zap,
 } from "lucide-react";
+import { API_BASE } from "../api/client";
 import type { Task, EventItem, Finding, ToolInfo, ProjectProfile, MiningDebug } from "./types";
 import ProgressBar from "./ProgressBar";
 import StatCard from "./StatCard";
@@ -23,8 +23,6 @@ import EventLog from "./EventLog";
 import FindingList from "./FindingList";
 import FindingDetail from "./FindingDetail";
 import ReportPanel from "./ReportPanel";
-
-const API = (import.meta as any).env?.VITE_API_BASE_URL || "";
 
 type Props = {
   task: Task | null;
@@ -73,10 +71,10 @@ export default function Workspace({
               <Square size={14} /> 停止
             </button>
           )}
-          <a className="btn btn-ghost" href={task ? `${API}/api/tasks/${task.id}/report.md` : "#"} target="_blank" rel="noreferrer">
+          <a className="btn btn-ghost" href={task ? `${API_BASE}/api/tasks/${task.id}/report.md` : "#"} target="_blank" rel="noreferrer">
             <Download size={15} /> 报告
           </a>
-          <a className="btn btn-ghost" href={task ? `${API}/api/tasks/${task.id}/report.json` : "#"} target="_blank" rel="noreferrer">
+          <a className="btn btn-ghost" href={task ? `${API_BASE}/api/tasks/${task.id}/report.json` : "#"} target="_blank" rel="noreferrer">
             <Download size={15} /> JSON
           </a>
         </div>

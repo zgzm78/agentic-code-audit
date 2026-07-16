@@ -1,7 +1,6 @@
 import { Download } from "lucide-react";
+import { API_BASE } from "../api/client";
 import type { MiningDebug, Task } from "./types";
-
-const API = (import.meta as any).env?.VITE_API_BASE_URL || "";
 
 type Props = {
   task: Task | null;
@@ -14,7 +13,7 @@ export default function MiningDebugPanel({ task, debug }: Props) {
     return (
       <div>
         <div className="debug-toolbar">
-          <a className="btn btn-ghost btn-sm" href={`${API}/api/tasks/${task.id}/mining-debug.json`} target="_blank" rel="noreferrer">
+          <a className="btn btn-ghost btn-sm" href={`${API_BASE}/api/tasks/${task.id}/mining-debug.json`} target="_blank" rel="noreferrer">
             <Download size={14} /> mining-debug.json
           </a>
         </div>
@@ -31,7 +30,7 @@ export default function MiningDebugPanel({ task, debug }: Props) {
   return (
     <div className="debug-panel">
       <div className="debug-toolbar">
-        <a className="btn btn-ghost btn-sm" href={`${API}/api/tasks/${task.id}/mining-debug.json`} target="_blank" rel="noreferrer">
+        <a className="btn btn-ghost btn-sm" href={`${API_BASE}/api/tasks/${task.id}/mining-debug.json`} target="_blank" rel="noreferrer">
           <Download size={14} /> mining-debug.json
         </a>
       </div>

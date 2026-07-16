@@ -28,7 +28,7 @@ RUN pip install "fastapi>=0.115.0" "uvicorn[standard]>=0.30.0" \
 
 ARG GITLEAKS_VERSION=8.30.1
 ARG OSV_SCANNER_VERSION=2.4.0
-ARG TRIVY_VERSION=0.57.1
+ARG TRIVY_VERSION=0.72.0
 ARG DOCKER_CLI_VERSION=27.5.1
 
 RUN mkdir -p .tools/bin \
