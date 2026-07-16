@@ -233,7 +233,7 @@ class DangerousFunctionLocator:
                 anchors.extend(self._clang_tidy_anchors(target, result, hints))
             elif result.tool == "gosec" and isinstance(result.raw, dict):
                 anchors.extend(self._gosec_anchors(target, result))
-            elif result.tool in {"npm-audit", "pip-audit", "cargo-audit", "osv-scanner"}:
+            elif result.tool in {"npm-audit", "pip-audit", "cargo-audit", "osv-scanner", "trivy"}:
                 anchors.extend(self._dependency_anchors(result))
             elif result.tool == "gitleaks" and isinstance(result.raw, list):
                 anchors.extend(self._secret_anchors(result))

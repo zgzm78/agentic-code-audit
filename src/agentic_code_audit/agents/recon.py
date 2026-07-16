@@ -27,7 +27,7 @@ class ReconInterpreter:
     def _dependency_findings_summary(self, tool_results: list[ToolResult]) -> list[dict[str, Any]]:
         summaries: list[dict[str, Any]] = []
         for result in tool_results:
-            if result.tool not in {"osv-scanner", "pip-audit", "npm-audit", "cargo-audit", "gosec"}:
+            if result.tool not in {"osv-scanner", "pip-audit", "npm-audit", "cargo-audit", "gosec", "trivy"}:
                 continue
             findings = result.findings or []
             top_ids: list[str] = []
@@ -153,7 +153,7 @@ class ReconAgent:
         return profile, event
 
     def _run_recon_tools(self, target: Path, recommendations: list[Any]) -> list[ToolResult]:
-        runnable = {"osv-scanner", "pip-audit", "npm-audit", "cargo-audit", "gosec"}
+        runnable = {"osv-scanner", "pip-audit", "npm-audit", "cargo-audit", "gosec", "trivy"}
         invocations = self.tool_planner.build_invocations(
             [item for item in recommendations if item.name in runnable],
             target,
