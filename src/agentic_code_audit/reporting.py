@@ -63,6 +63,7 @@ class ReportAgent:
         )
         self._append_mining_strategy(lines, report)
         self._append_tool_results(lines, report)
+        self._append_sca_section(lines, report)
         self._append_mining_summary(lines, report)
 
         self._append_findings_by_severity(lines, report.findings, verification_by_finding)
@@ -586,6 +587,49 @@ class ReportAgent:
                 f"artifacts=`{artifacts or 'none'}`; {result.summary}"
             )
         lines.append("")
+
+    def _append_sca_section(self, lines: list[str], report: AuditReport) -> None:
+        dep_findings = [f for f in report.findings if f.vulnerability_type == "dependency_vulnerability"]
+        if not dep_findings:
+            lines.extend(["## 软件成分分析 (SCA)", "", "未发现已知依赖漏洞。", ""])
+            return
+
+        lines.extend(["## 软件成分分析 (SCA)", ""])
+
+        severity_counts: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNKNOWN": 0}
+        scanners: set[str] = set()
+        for f in dep_findings:
+            sev = f.severity.upper()
+            severity_counts[sev if sev in severity_counts else "UNKNOWN"] += 1
+            scanners.add(f.tool)
+
+        lines.extend([
+            "### 依赖漏洞概览",
+            "",
+            "| 严重程度 | 数量 |",
+            "|----------|------|",
+        ])
+        for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]:
+            if severity_counts.get(sev, 0) > 0:
+                lines.append(f"| **{sev}** | {severity_counts[sev]} |")
+        lines.append(f"| **总计** | {len(dep_findings)} |")
+        lines.append("")
+        lines.append(f"**涉及扫描器:** {', '.join(sorted(scanners))}")
+        lines.append("")
+
+        for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+            items = [f for f in dep_findings if f.severity.upper() == sev]
+            if not items:
+                continue
+            lines.extend([f"### {sev} 级别依赖漏洞", ""])
+            for idx, f in enumerate(items[:30], 1):
+                pkg = f.sink or f.file_path or "unknown"
+                vuln_id = f.cwe or ""
+                lines.append(
+                    f"- **{pkg}** `{f.id}` `{vuln_id}` — {f.description[:200]} "
+                    f"(来源: {f.tool}, 置信度: {int(f.confidence * 100)}%)"
+                )
+            lines.append("")
 
     def _append_mining_summary(self, lines: list[str], report: AuditReport) -> None:
         lines.extend(

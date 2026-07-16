@@ -11,7 +11,7 @@
 | 队列 | worker/Redis 类结构 | 进程内后台任务，后续可替换 |
 | 数据库 | 持久化任务、事件、finding | SQLite 表覆盖任务、事件、工具、切片、候选、验证和 artifact |
 | Agent | Recon/Analysis/Verification/Tool | Recon/Tool/DangerousFunction/Slice/Candidate/Aggregator/Classifier/Verification/Report |
-| 工具 | Semgrep、Bandit、Gitleaks、OSV 等 | Semgrep、Bandit、Gitleaks、OSV、npm audit、内置规则 |
+| 工具 | Semgrep、Bandit、Gitleaks、OSV 等 | Semgrep、Bandit、Gitleaks、OSV、npm audit、Trivy、内置规则 |
 | 验证 | LLM harness + sandbox | LLM planner + Docker sandbox + EvidenceChecker |
 | 报告 | 前端报告视图和导出 | Markdown/JSON、链路图、PoC、真实执行证据 |
 

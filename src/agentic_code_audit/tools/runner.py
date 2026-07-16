@@ -189,6 +189,7 @@ class ToolRegistry:
                 "--allow-no-lockfiles",
                 str(target),
             ],
+            "trivy": ["trivy", "fs", "--format", "json", "--quiet", "--scanners", "vuln", str(target)],
             "bandit": ["bandit", "-r", str(target), "-f", "json"],
             "npm-audit": ["npm", "audit", "--json"],
             "cppcheck": [
@@ -348,7 +349,7 @@ class ToolRegistry:
             )
 
     def _project_tool_names(self, target: Path) -> list[str]:
-        selected = ["rg", "semgrep", "gitleaks", "osv-scanner"]
+        selected = ["rg", "semgrep", "gitleaks", "osv-scanner", "trivy"]
         if self._has_python_project(target):
             selected.extend(["bandit", "pip-audit"])
         if (target / "package.json").exists():
@@ -525,7 +526,7 @@ class ToolParsers:
         if parser == "clang-tidy":
             findings = self._clang_tidy_findings(text)
             return {"findings": findings}, findings, f"findings={len(findings)}"
-        if parser in {"semgrep", "gitleaks", "osv-scanner", "bandit", "npm-audit", "pip-audit", "cargo-audit", "gosec"}:
+        if parser in {"semgrep", "gitleaks", "osv-scanner", "bandit", "npm-audit", "pip-audit", "cargo-audit", "gosec", "trivy"}:
             raw = self._json(text)
             findings = self._findings(parser, raw)
             return raw if raw is not None else text[:8000], findings, f"findings={len(findings)}"
@@ -577,6 +578,24 @@ class ToolParsers:
             issues = raw.get("Issues")
             if isinstance(issues, list):
                 return issues
+        if parser == "trivy" and isinstance(raw, dict):
+            findings: list[dict[str, Any]] = []
+            for result in raw.get("Results", []):
+                target = str(result.get("Target", ""))
+                for vuln in result.get("Vulnerabilities", []):
+                    findings.append({
+                        "package": f"{target}/{vuln.get('PkgName', '')}",
+                        "id": vuln.get("VulnerabilityID", ""),
+                        "severity": vuln.get("Severity", ""),
+                        "title": vuln.get("Title", ""),
+                        "installed_version": vuln.get("InstalledVersion", ""),
+                        "fixed_version": vuln.get("FixedVersion", ""),
+                        "cvss": vuln.get("CVSS", {}),
+                        "cwe_ids": vuln.get("CweIDs", []),
+                        "references": vuln.get("References", []),
+                        "description": vuln.get("Description", ""),
+                    })
+            return findings
         return []
 
     def _cppcheck_findings(self, text: str) -> list[dict[str, Any]]:

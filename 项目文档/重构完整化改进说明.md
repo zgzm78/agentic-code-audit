@@ -78,7 +78,7 @@ flowchart LR
 - `rg`/ripgrep：快速定位危险函数、命令执行、文件操作、反序列化、SQL 拼接、网络输入、解析入口。
 - Semgrep：执行语言规则和 taint 规则，输出文件、行号、规则 ID、message、metadata。
 - tree-sitter 或语言 AST：提取函数边界、调用点、参数名、变量定义、控制条件。
-- 依赖扫描：OSV、npm audit、pip-audit、cargo-audit、govulncheck 等。
+- 依赖扫描：OSV、npm audit、pip-audit、cargo-audit、govulncheck、Trivy 等。
 - Secret 扫描：Gitleaks。
 - C/C++ 静态工具：cppcheck、clang-tidy、clang-query、CodeQL、Joern、ctags、clangd/libclang。
 - Python/JS/Go/Rust 等语言专项工具：Bandit、ESLint security rules、gosec、cargo clippy 等。
@@ -463,7 +463,7 @@ Secret 与配置：
 
 分阶段工具范围：
 
-- 阶段二，工具模块基础与核心工具闭环：安装/确保 `rg`、`semgrep`、`gitleaks`、`osv-scanner`、`bandit`、`npm audit`。目标是让 ToolRegistry、ToolRunner、ToolParser、ToolCache 跑通。
+- 阶段二，工具模块基础与核心工具闭环：安装/确保 `rg`、`semgrep`、`gitleaks`、`osv-scanner`、`bandit`、`npm audit`、`trivy`。目标是让 ToolRegistry、ToolRunner、ToolParser、ToolCache 跑通。
 - 阶段三/四，随 Recon 和漏洞挖掘补静态分析工具：接入 `cppcheck`、`clang-tidy`、`pip-audit`、`gosec`、`cargo-audit`；`CodeQL`、`Joern` 先做 optional 检测和 registry 预留，只有在切片/数据流实现真正调用时再安装。
 - 阶段五，随动态验证/利用补运行环境工具：安装/确保 `cmake`、`ninja`、`gcc/g++`、`clang/clang++`、ASAN/UBSAN/LSAN 支持、`valgrind`、`gdb/lldb`、`pytest`、`vitest/jest`、`curl`、`sqlite3` 和常见数据库 client。
 - 后续增强，重型工具：`CodeQL`、`Joern`、`Trivy`、`Syft`、`AFL++`、`libFuzzer` 等需要配套缓存、资源限制和长任务进度后再安装。
