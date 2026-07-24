@@ -144,6 +144,26 @@ class FunctionSummary:
     signature: str
     summary: str
     tags: list[str] = field(default_factory=list)
+    line_end: int | None = None
+    language: str = ""
+    parameters: list[str] = field(default_factory=list)
+    calls: list[str] = field(default_factory=list)
+    field_reads: list[str] = field(default_factory=list)
+    field_writes: list[str] = field(default_factory=list)
+    guards: list[str] = field(default_factory=list)
+    sinks: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CallEdgeSummary:
+    caller: str
+    callee: str
+    file_path: str
+    line: int
+    resolution: str = "lexical"
+    confidence: float = 0.55
+    arguments: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -158,6 +178,7 @@ class RouteSummary:
 @dataclass
 class SemanticIndex:
     functions: list[FunctionSummary] = field(default_factory=list)
+    call_edges: list[CallEdgeSummary] = field(default_factory=list)
     routes: list[RouteSummary] = field(default_factory=list)
     source_symbols: list[str] = field(default_factory=list)
     sink_symbols: list[str] = field(default_factory=list)
@@ -210,6 +231,65 @@ class ChainGraph:
 
 
 @dataclass
+class EvidenceNode:
+    id: str
+    type: str
+    label: str
+    file_path: str = ""
+    line: int | None = None
+    function: str = ""
+    detail: str = ""
+    facts: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EvidenceEdge:
+    source: str
+    target: str
+    type: str
+    label: str = ""
+    evidence: str = ""
+    provenance: str = "fact_ast"
+    confidence: float = 1.0
+    facts: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EvidencePath:
+    id: str
+    kind: str
+    status: str
+    node_ids: list[str] = field(default_factory=list)
+    edge_ids: list[int] = field(default_factory=list)
+    source_node_id: str = ""
+    sink_node_id: str = ""
+    entry_node_id: str = ""
+    gaps: list[str] = field(default_factory=list)
+    provenance: str = "fact_ast"
+    confidence: float = 0.0
+
+
+@dataclass
+class EvidenceGraph:
+    id: str
+    status: str
+    sink_node_id: str = ""
+    nodes: list[EvidenceNode] = field(default_factory=list)
+    edges: list[EvidenceEdge] = field(default_factory=list)
+    paths: list[EvidencePath] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+    sinks: list[str] = field(default_factory=list)
+    guards: list[str] = field(default_factory=list)
+    sanitizers: list[str] = field(default_factory=list)
+    gaps: list[str] = field(default_factory=list)
+    fact_count: int = 0
+    hypothesis_count: int = 0
+    confidence: float = 0.0
+    backends: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class DangerousFunction:
     id: str
     file_path: str
@@ -231,6 +311,7 @@ class DangerousFunction:
     rule_vuln_type: str = ""
     anchor_category: str = ""
     risk_domain: str = ""
+    signal_kind: str = ""
     weak_signal: bool = False
     optional_tools_not_run: list[str] = field(default_factory=list)
 
@@ -264,6 +345,20 @@ class ProgramSlice:
     anchor_category: str = ""
     anchor_tool: str = ""
     anchor_confidence: float = 0.0
+    signal_kind: str = ""
+    flow_status: str = ""
+    slice_status: str = ""
+    source_variables: list[str] = field(default_factory=list)
+    sink_variables: list[str] = field(default_factory=list)
+    taint_path: list[dict[str, Any]] = field(default_factory=list)
+    flow_gaps: list[str] = field(default_factory=list)
+    evidence_graph: EvidenceGraph = field(default_factory=lambda: EvidenceGraph(id="", status="sink_only"))
+    function_summary: dict[str, Any] = field(default_factory=dict)
+    backward_slice: dict[str, Any] = field(default_factory=dict)
+    call_paths: list[list[str]] = field(default_factory=list)
+    entry_points: list[str] = field(default_factory=list)
+    interprocedural_flow: dict[str, Any] = field(default_factory=dict)
+    analysis_backends: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -290,8 +385,26 @@ class VulnerabilityCandidate:
     validity: str = "valid"
     llm_reasoning: str = ""
     candidate_source: str = "llm"  # "tool" | "rule" | "llm"
+    candidate_state: str = "candidate"  # "candidate" | "needs_context" | "rejected" | "invalid"
     invalid_reason: str = ""
     risk_domain: str = ""
+    signal_kind: str = ""
+    flow_status: str = ""
+    slice_status: str = ""
+    source_variables: list[str] = field(default_factory=list)
+    sink_variables: list[str] = field(default_factory=list)
+    taint_path: list[dict[str, Any]] = field(default_factory=list)
+    flow_gaps: list[str] = field(default_factory=list)
+    function_summary: dict[str, Any] = field(default_factory=dict)
+    backward_slice: dict[str, Any] = field(default_factory=dict)
+    call_paths: list[list[str]] = field(default_factory=list)
+    entry_points: list[str] = field(default_factory=list)
+    interprocedural_flow: dict[str, Any] = field(default_factory=dict)
+    analysis_backends: list[str] = field(default_factory=list)
+    triage_verdict: str = ""
+    triage_reason: str = ""
+    triage_missing_context: list[str] = field(default_factory=list)
+    triage_evidence_refs: list[str] = field(default_factory=list)
     director_priority: int = 0
     director_reason: str = ""
     verification_hint: dict[str, Any] = field(default_factory=dict)
@@ -299,12 +412,26 @@ class VulnerabilityCandidate:
     def mark_valid(self) -> None:
         self.validity = "valid"
         self.valid = True
+        self.candidate_state = "candidate"
         self.invalid_reason = ""
 
     def mark_invalid(self, reason: str) -> None:
         self.validity = "invalid_candidate"
         self.valid = False
+        self.candidate_state = "invalid"
         self.invalid_reason = reason or "invalid_candidate"
+
+    def mark_needs_context(self, reason: str) -> None:
+        self.validity = "needs_context"
+        self.valid = False
+        self.candidate_state = "needs_context"
+        self.invalid_reason = reason or "needs_more_context"
+
+    def mark_rejected(self, reason: str) -> None:
+        self.validity = "rejected"
+        self.valid = False
+        self.candidate_state = "rejected"
+        self.invalid_reason = reason or "rejected"
 
 
 @dataclass
@@ -345,8 +472,27 @@ class Finding:
     tool_run_refs: list[str] = field(default_factory=list)
     artifact_refs: list[str] = field(default_factory=list)
     chain_graph: ChainGraph = field(default_factory=ChainGraph)
+    call_graph: ChainGraph = field(default_factory=ChainGraph)
+    evidence_graph: EvidenceGraph = field(default_factory=lambda: EvidenceGraph(id="", status="sink_only"))
     chinese_summary: str = ""
     risk_domain: str = ""
+    signal_kind: str = ""
+    flow_status: str = ""
+    slice_status: str = ""
+    source_variables: list[str] = field(default_factory=list)
+    sink_variables: list[str] = field(default_factory=list)
+    taint_path: list[dict[str, Any]] = field(default_factory=list)
+    flow_gaps: list[str] = field(default_factory=list)
+    function_summary: dict[str, Any] = field(default_factory=dict)
+    backward_slice: dict[str, Any] = field(default_factory=dict)
+    call_paths: list[list[str]] = field(default_factory=list)
+    entry_points: list[str] = field(default_factory=list)
+    interprocedural_flow: dict[str, Any] = field(default_factory=dict)
+    analysis_backends: list[str] = field(default_factory=list)
+    triage_verdict: str = ""
+    triage_reason: str = ""
+    triage_missing_context: list[str] = field(default_factory=list)
+    triage_evidence_refs: list[str] = field(default_factory=list)
     director_priority: int = 0
     director_reason: str = ""
     verification_hint: dict[str, Any] = field(default_factory=dict)

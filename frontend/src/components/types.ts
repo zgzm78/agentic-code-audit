@@ -48,6 +48,12 @@ export type Finding = {
   description: string;
   chinese_summary?: string;
   chain_graph?: ChainGraph;
+  call_graph?: ChainGraph;
+  call_paths?: string[][];
+  entry_points?: string[];
+  interprocedural_flow?: Record<string, unknown>;
+  analysis_backends?: string[];
+  evidence_graph?: Record<string, unknown>;
   evidence?: string[];
   trigger_conditions?: string[];
   verification?: VerificationInfo | null;
@@ -108,6 +114,7 @@ export type MiningDebug = {
   candidate_count_by_risk_domain?: Record<string, number>;
   aggregation_input_count?: number;
   aggregation_output_count?: number;
+  investigation_candidates?: Array<Record<string, unknown>>;
   finding_count_by_type?: Record<string, number>;
   finding_count_by_risk_domain?: Record<string, number>;
   finding_severity_distribution?: Record<string, number>;

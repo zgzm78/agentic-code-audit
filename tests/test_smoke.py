@@ -840,15 +840,13 @@ def test_slice_analyzer_javascript_fallback_path(tmp_path: Path):
     assert slices[0].function_name == "run"
 
 
-def test_slice_analyzer_cpp_regex_fallback_when_ctags_missing(tmp_path: Path, monkeypatch):
+def test_slice_analyzer_cpp_regex_fallback_when_ctags_missing(tmp_path: Path):
     target = tmp_path / "native"
     target.mkdir()
     (target / "main.cpp").write_text(
         "int run(char *dst, const char *src) {\n    return strcpy(dst, src) != 0;\n}\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("agentic_code_audit.agents.mining.shutil.which", lambda _name: None)
-
     dangerous = DangerousFunctionLocator().locate(target, [])
     slices = SliceAnalyzer().analyze(target, dangerous, SemanticIndex(), FakeLLM())  # type: ignore[arg-type]
 
@@ -957,7 +955,7 @@ def test_llm_string_evidence_is_not_split_into_characters():
     assert candidates[0].evidence == ["GitHub Actions"]
 
 
-def test_audit_budget_modes_are_enforced_in_mining_components(tmp_path: Path):
+def test_audit_budget_keeps_all_mining_evidence_before_final_ranking(tmp_path: Path):
     target = tmp_path / "project"
     target.mkdir()
     for idx in range(20):
@@ -971,9 +969,39 @@ def test_audit_budget_modes_are_enforced_in_mining_components(tmp_path: Path):
     slices = SliceAnalyzer().analyze(target, dangerous, SemanticIndex(), FakeLLM(), budget)  # type: ignore[arg-type]
     candidates = CandidateGenerator().generate(slices, FakeLLM(), budget)  # type: ignore[arg-type]
 
-    assert len(dangerous) <= budget.max_anchors
-    assert len(slices) <= budget.max_slices
-    assert len(candidates) <= budget.max_candidates
+    assert len(dangerous) >= 20
+    assert len(slices) == len(dangerous)
+    assert len(candidates) == len(slices)
+    assert budget.max_findings == 0
+    assert budget.max_llm_calls == 8
+    assert budget.enable_config_audit is False
+
+
+def test_llm_generation_budget_does_not_drop_tool_slices() -> None:
+    slices = [
+        ProgramSlice(
+            id=f"slice-{idx}",
+            dangerous_function_id=f"danger-{idx}",
+            file_path=f"app{idx}.py",
+            line_start=12,
+            function_name=f"run{idx}",
+            source="request.args",
+            sink="os.system",
+            context="os.system(value)",
+            rule_vuln_type="command_injection",
+            anchor_category="source_code",
+            anchor_tool="semgrep",
+            tool_run_refs=["semgrep-run"],
+            flow_status="propagated",
+            slice_status="local_tainted_flow",
+        )
+        for idx in range(40)
+    ]
+
+    candidates = CandidateGenerator().generate(slices, FakeLLM(), AuditBudget.for_mode("quick"))  # type: ignore[arg-type]
+
+    assert len(candidates) == len(slices)
+    assert any("llm_generation_budget_exhausted" in candidate.assumptions for candidate in candidates)
 
 
 def test_quick_budget_suppresses_config_anchors(tmp_path: Path):
@@ -1142,6 +1170,25 @@ def test_mining_debug_and_report_include_director_strategy(tmp_path: Path):
                 risk_domain="supply_chain_config",
             ),
         ],
+        program_slices=[
+            ProgramSlice(
+                id="slice-1",
+                dangerous_function_id="df-source",
+                file_path="src/parser.cpp",
+                line_start=1,
+                function_name="parseImage",
+                source="parameter:buf",
+                sink="memcpy",
+                context="memcpy(dst, src, len)",
+                flow_status="parameter_flow",
+                slice_status="parameter_flow_unresolved",
+                backward_slice={
+                    "role_args": {"destination": "dst", "source": "src", "length": "len"},
+                    "field_reads": ["p_->blockSize_"],
+                    "missing_guards": ["actual source buffer size check"],
+                },
+            )
+        ],
         candidates=[
             VulnerabilityCandidate(
                 id="candidate-1",
@@ -1166,6 +1213,9 @@ def test_mining_debug_and_report_include_director_strategy(tmp_path: Path):
     assert debug["rejected_strategy_items"][0]["value"] == "cppcheck"
     assert debug["strategy_effects"]["candidate_top_after"] == ["candidate-1"]
     assert debug["anchor_count_by_risk_domain"] == {"source_code": 1, "supply_chain_config": 1}
+    assert debug["flow_status_distribution"]["parameter_flow"] == 1
+    assert debug["backward_slice_summary"]["slice_count"] == 1
+    assert debug["backward_slice_summary"]["missing_guards"]["actual source buffer size check"] == 1
 
     report = AuditReport(
         input_source=InputSource(original="local", kind="local", local_path=str(tmp_path)),
@@ -1223,7 +1273,78 @@ def test_invalid_candidate_is_not_aggregated():
     assert ClueAggregator().aggregate([candidate]) == []
 
 
-def test_config_security_candidate_without_function_is_reportable(tmp_path: Path):
+def test_needs_context_candidate_is_aggregated_but_not_reported():
+    program_slice = ProgramSlice(
+        id="slice-1",
+        dangerous_function_id="danger-1",
+        file_path="app.py",
+        line_start=12,
+        function_name="run",
+        source="request.args",
+        sink="os.system",
+        context="os.system(value)",
+        rule_vuln_type="command_injection",
+        anchor_category="source_code",
+        flow_status="sink_unlinked",
+        slice_status="parameter_flow_unresolved",
+    )
+    candidate = VulnerabilityCandidate(
+        id="candidate-1",
+        slice_id="slice-1",
+        title="待调查命令注入线索",
+        vulnerability_type="command_injection",
+        severity="high",
+        file_path="app.py",
+        line_start=12,
+        description="缺少调用者上下文。",
+        source="request.args",
+        sink="os.system",
+        valid=False,
+        validity="needs_context",
+        candidate_state="needs_context",
+        invalid_reason="llm_needs_more_context(caller_source_not_resolved)",
+    )
+
+    aggregated = ClueAggregator().aggregate([candidate])
+    findings = VulnerabilityClassifier().classify(aggregated, [program_slice], FakeLLM())  # type: ignore[arg-type]
+
+    assert [item.id for item in aggregated] == ["candidate-1"]
+    assert aggregated[0].candidate_state == "needs_context"
+    assert findings == []
+
+
+def test_mining_debug_exposes_needs_context_candidates():
+    candidate = VulnerabilityCandidate(
+        id="candidate-1",
+        slice_id="slice-1",
+        title="待调查线索",
+        vulnerability_type="command_injection",
+        severity="high",
+        file_path="app.py",
+        line_start=12,
+        description="缺少上下文。",
+        function_name="run",
+        source="parameter:cmd",
+        sink="os.system",
+        valid=False,
+        validity="needs_context",
+        candidate_state="needs_context",
+        invalid_reason="llm_needs_more_context(caller)",
+        triage_verdict="needs_more_context",
+        triage_reason="caller_source_not_resolved",
+        triage_missing_context=["caller"],
+    )
+    mining_result = MiningResult(candidates=[candidate], aggregated_candidates=[candidate])
+
+    debug = generate_mining_debug(mining_result)
+
+    assert debug["candidate_validity_breakdown"]["needs_context"] == 1
+    assert debug["candidate_validity_breakdown"]["invalid"] == 0
+    assert debug["investigation_candidates"][0]["id"] == "candidate-1"
+    assert debug["investigation_candidates"][0]["candidate_state"] == "needs_context"
+
+
+def test_config_security_candidate_without_function_is_suppressed(tmp_path: Path):
     target = tmp_path / "repo"
     workflow = target / ".github" / "workflows" / "ci.yml"
     workflow.parent.mkdir(parents=True)
@@ -1253,18 +1374,50 @@ def test_config_security_candidate_without_function_is_reportable(tmp_path: Path
     )
 
     dangerous = DangerousFunctionLocator().locate(target, [semgrep_result])
-    slices = SliceAnalyzer().analyze(target, dangerous, SemanticIndex(), FakeLLM())  # type: ignore[arg-type]
-    candidates = CandidateGenerator().generate(slices, FakeLLM())  # type: ignore[arg-type]
-    aggregated = ClueAggregator().aggregate(candidates)
-    findings = VulnerabilityClassifier().classify(aggregated, slices, FakeLLM())  # type: ignore[arg-type]
 
-    assert dangerous[0].kind == "configuration_security"
-    assert slices[0].source == "configuration file"
-    assert candidates[0].validity == "valid"
-    assert aggregated
-    assert findings
-    assert findings[0].vulnerability_type == "supply_chain_config"
-    assert findings[0].should_verify is False
+    assert dangerous == []
+
+
+def test_classifier_does_not_cap_final_findings() -> None:
+    candidates: list[VulnerabilityCandidate] = []
+    slices: list[ProgramSlice] = []
+    for idx in range(90):
+        slice_id = f"slice-{idx}"
+        slices.append(
+            ProgramSlice(
+                id=slice_id,
+                dangerous_function_id=f"danger-{idx}",
+                file_path=f"app{idx}.py",
+                line_start=12,
+                function_name=f"run{idx}",
+                source="request.args",
+                sink="os.system",
+                context="os.system(value)",
+                rule_vuln_type="command_injection",
+                anchor_category="source_code",
+                flow_status="propagated",
+                slice_status="local_tainted_flow",
+            )
+        )
+        candidates.append(
+            VulnerabilityCandidate(
+                id=f"candidate-{idx}",
+                slice_id=slice_id,
+                title=f"命令注入候选 {idx}",
+                vulnerability_type="command_injection",
+                severity="high",
+                file_path=f"app{idx}.py",
+                line_start=12,
+                description="用户输入进入 os.system。",
+                trigger_conditions=["参数可控"],
+                evidence=["source=request.args", "sink=os.system"],
+                confidence=0.7,
+            )
+        )
+
+    findings = VulnerabilityClassifier().classify(candidates, slices, FakeLLM(), AuditBudget.for_mode("quick"))  # type: ignore[arg-type]
+
+    assert len(findings) == 90
 
 
 def test_classifier_adds_non_empty_effect_to_chain_graph():
@@ -1308,6 +1461,8 @@ def test_classifier_adds_non_empty_effect_to_chain_graph():
     assert "GET /ping" in node_labels
     assert "input validation" in node_labels
     assert any(edge.type == "missing_control" for edge in findings[0].chain_graph.edges)
+    assert [node.label for node in findings[0].call_graph.nodes] == ["GET /ping", "ping", "os.system"]
+    assert any(edge.type == "calls" for edge in findings[0].call_graph.edges)
     assert findings[0].severity == "critical"
     assert findings[0].should_verify is True
     assert findings[0].tool_run_refs == ["run-1", "run-2"]
@@ -1882,9 +2037,21 @@ def test_recon_to_mining_store_persistence_end_to_end(tmp_path: Path):
     runner.env["PATH"] = ""
     planner = ToolPlanner(runner.registry, runner.env)
     profile, _ = ReconAgent(settings, tool_runner=runner, tool_planner=planner).run(target)
+    class AcceptingTriageLLM(FakeLLM):
+        def chat(self, *_args, **_kwargs):
+            return type(
+                "Resp",
+                (),
+                {
+                    "ok": True,
+                    "content": '[{"verdict":"accept","reason":"test fixture source reaches sink"}]',
+                    "error": "",
+                },
+            )()
+
     mining_agent = VulnerabilityMiningAgent(
         tool_runner=runner,
-        llm_client=FakeLLM(),  # type: ignore[arg-type]
+        llm_client=AcceptingTriageLLM(),  # type: ignore[arg-type]
         tool_planner=planner,
     )
     mining = mining_agent.run(target, profile, SemanticIndex())

@@ -17,7 +17,7 @@ RUN set -eux; \
     fi; \
     printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries; \
     apt-get update \
-    && apt-get install -y --no-install-recommends git curl ca-certificates ripgrep \
+    && apt-get install -y --no-install-recommends git curl ca-certificates ripgrep unzip \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
@@ -30,6 +30,8 @@ ARG GITLEAKS_VERSION=8.30.1
 ARG OSV_SCANNER_VERSION=2.4.0
 ARG TRIVY_VERSION=0.72.0
 ARG DOCKER_CLI_VERSION=27.5.1
+ARG INSTALL_CODEQL=true
+ARG CODEQL_DOWNLOAD_PACKS=true
 
 RUN mkdir -p .tools/bin \
     && curl --fail --location --show-error "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz \
@@ -45,6 +47,21 @@ RUN mkdir -p .tools/bin \
     && chmod +x /usr/local/bin/docker \
     && rm -rf /tmp/gitleaks.tar.gz /tmp/trivy.tar.gz /tmp/docker.tgz /tmp/docker
 
+RUN if [ "${INSTALL_CODEQL}" = "true" ]; then \
+      mkdir -p .tools \
+      && curl --fail --location --show-error "https://github.com/github/codeql-cli-binaries/releases/latest/download/codeql-linux64.zip" -o /tmp/codeql.zip \
+      && unzip -q /tmp/codeql.zip -d .tools \
+      && chmod +x .tools/codeql/codeql \
+      && if [ "${CODEQL_DOWNLOAD_PACKS}" = "true" ]; then \
+           .tools/codeql/codeql pack download codeql/cpp-queries \
+           && .tools/codeql/codeql pack download codeql/python-queries \
+           && .tools/codeql/codeql pack download codeql/javascript-queries \
+           && .tools/codeql/codeql pack download codeql/java-queries \
+           && .tools/codeql/codeql pack download codeql/go-queries; \
+         fi \
+      && rm -f /tmp/codeql.zip; \
+    fi
+
 COPY src ./src
 COPY rules ./rules
 COPY examples ./examples
@@ -53,7 +70,7 @@ COPY scripts ./scripts
 
 RUN pip install -e . --no-deps
 
-ENV PATH="/app/.tools/semgrep-venv/bin:/app/.tools/bin:${PATH}"
+ENV PATH="/app/.tools/semgrep-venv/bin:/app/.tools/bin:/app/.tools/codeql:${PATH}"
 EXPOSE 8000
 
 CMD ["agentic-code-audit-backend"]

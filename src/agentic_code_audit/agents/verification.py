@@ -280,6 +280,22 @@ class StaticVerifier:
         missing_guards = list(program_slice.missing_guards) if program_slice else []
         data_flow = list(program_slice.data_flow) if program_slice else []
         call_chain = list(program_slice.call_chain) if program_slice else list(finding.call_chain)
+        evidence_graph = program_slice.evidence_graph if program_slice else finding.evidence_graph
+        has_evidence_graph = bool(getattr(evidence_graph, "id", ""))
+        graph_status = (
+            getattr(program_slice, "slice_status", "")
+            or getattr(finding, "slice_status", "")
+            or (getattr(evidence_graph, "status", "") if has_evidence_graph else "")
+        )
+        graph_paths = list(getattr(evidence_graph, "paths", []) or [])
+        fact_taint_path = any(path.kind == "taint" and path.status == "proven" for path in graph_paths)
+        parameter_path = any(path.kind == "taint" and path.status == "source_unresolved" for path in graph_paths)
+        if not has_evidence_graph:
+            fact_taint_path = bool(data_flow)
+            entry_reachable = bool(call_chain)
+        else:
+            entry_reachable = graph_status in {"entry_tainted_flow", "entry_parameter_flow", "entry_reachable_no_taint"}
+        graph_gaps = list(getattr(evidence_graph, "gaps", []) or [])
         tool_run_refs = list(dict.fromkeys([
             *finding.tool_run_refs,
             *(program_slice.tool_run_refs if program_slice else []),
@@ -316,6 +332,11 @@ class StaticVerifier:
             "missing_guards_present": bool(missing_guards),
             "call_chain_present": bool(call_chain),
             "data_flow_present": bool(data_flow),
+            "evidence_graph_status": graph_status,
+            "fact_taint_path": fact_taint_path,
+            "parameter_path": parameter_path,
+            "entry_reachable": entry_reachable,
+            "graph_gaps": graph_gaps[:8],
             "tool_corroborated": tool_corroborated,
             "tool_refs_resolve": tool_refs_resolve,
             "evidence_present": bool(finding.evidence),
@@ -338,10 +359,22 @@ class StaticVerifier:
             static_status = "likely_false_positive"
             reachability = "unlikely"
             reason = "Mining trace is invalid or references an invalid candidate."
-        elif source and sink and (missing_guards or data_flow or call_chain or tool_corroborated or direct_parameter_flow):
+        elif source and sink and fact_taint_path:
             static_status = "plausible"
-            reachability = "reachable" if data_flow or call_chain else "likely_reachable"
-            reason = "Source, sink, and corroborating reachability or guard evidence are present."
+            reachability = "reachable" if entry_reachable else "likely_reachable"
+            reason = "Evidence graph contains a fact-backed tainted path from source to sink."
+        elif source and sink and direct_parameter_flow and not parameter_path:
+            static_status = "plausible"
+            reachability = "likely_reachable"
+            reason = "A function parameter is passed directly to the dangerous sink."
+        elif source and sink and parameter_path:
+            static_status = "weak_static_proof"
+            reachability = "likely_reachable" if entry_reachable else "unknown"
+            reason = "A parameter reaches the sink, but the caller-controlled source is unresolved."
+        elif source and sink and (missing_guards or tool_corroborated or graph_status in {"entry_reachable_no_taint", "local_tainted_flow"}):
+            static_status = "weak_static_proof"
+            reachability = "likely_reachable" if entry_reachable else "unknown"
+            reason = "Source and sink evidence exists, but a fact-backed taint path is not complete."
         elif sink and finding.evidence:
             static_status = "weak_static_proof"
             reachability = "likely_reachable" if source or finding.reachability in {"reachable", "likely_reachable"} else "unknown"
@@ -494,9 +527,7 @@ class StaticVerifier:
             if reachability in {"likely_reachable", "unknown", "unlikely"}:
                 result.reachability = reachability
                 accepted = True
-            elif reachability == "reachable" and (
-                result.rule_checks.get("call_chain_present") or result.rule_checks.get("data_flow_present")
-            ):
+            elif reachability == "reachable" and result.rule_checks.get("fact_taint_path"):
                 result.reachability = reachability
                 accepted = True
         result.dynamic_eligible = (

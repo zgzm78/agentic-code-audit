@@ -3,20 +3,22 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
-import os
 import re
-import shutil
-import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from ..audit_budget import AuditBudget, BudgetUsage
+from ..code_graph import CPP_SUFFIXES, CppFunctionIndexer
+from ..codeql import CodeQLAnalyzer
+from ..dataflow import FlowStep, VariableFlowAnalyzer, VariableFlowResult
+from ..evidence_graph import EvidenceGraphBuilder, EvidenceGraphInput
+from ..interprocedural import InterproceduralSlicer
 from ..llm import DeepSeekClient
 from ..normalizer import VulnerabilityTypeNormalizer
-from ..vulnerability_types import VulnType, RiskDomain, risk_domain_for, is_dynamic_verification_candidate
+from ..vulnerability_types import VulnType, risk_domain_for, is_dynamic_verification_candidate
 from .mining_director import MiningStrategy
 from ..models import (
     AgentEvent,
@@ -25,6 +27,7 @@ from ..models import (
     ChainNode,
     DangerousFunction,
     Finding,
+    FunctionSummary,
     ProgramSlice,
     ProjectProfile,
     SemanticIndex,
@@ -33,6 +36,7 @@ from ..models import (
     normalize_path,
     utc_now,
 )
+from ..path_policy import PathPolicy
 from ..rules import RulesLoader
 from ..tools.runner import SecurityToolRunner, ToolPlanner, ToolRunner, run_invocations_parallel
 
@@ -87,6 +91,53 @@ class MiningResult:
     budget: dict[str, Any] = field(default_factory=dict)
     budget_usage: dict[str, Any] = field(default_factory=dict)
     strategy_effects: dict[str, Any] = field(default_factory=dict)
+    signal_counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class MiningSignalStreams:
+    source_code: list[DangerousFunction] = field(default_factory=list)
+    dependency: list[DangerousFunction] = field(default_factory=list)
+    secret: list[DangerousFunction] = field(default_factory=list)
+    supply_chain_config: list[DangerousFunction] = field(default_factory=list)
+    unsupported: list[DangerousFunction] = field(default_factory=list)
+
+    @property
+    def static_evidence(self) -> list[DangerousFunction]:
+        return [*self.dependency, *self.secret]
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "source_code": len(self.source_code),
+            "dependency": len(self.dependency),
+            "secret": len(self.secret),
+            "supply_chain_config": len(self.supply_chain_config),
+            "unsupported": len(self.unsupported),
+        }
+
+
+class SignalRouter:
+    """Route tool/rule signals into evidence streams before slicing."""
+
+    SUPPORTED_STATIC_DOMAINS = {"dependency", "secret"}
+
+    def route(self, anchors: list[DangerousFunction]) -> MiningSignalStreams:
+        streams = MiningSignalStreams()
+        for anchor in anchors:
+            domain = anchor.risk_domain or anchor.anchor_category
+            if domain == "source_code":
+                anchor.signal_kind = "code_sink"
+                streams.source_code.append(anchor)
+            elif domain in self.SUPPORTED_STATIC_DOMAINS:
+                anchor.signal_kind = {
+                    "dependency": "dependency_advisory",
+                    "secret": "secret_exposure",
+                }[domain]
+                getattr(streams, domain).append(anchor)
+            else:
+                anchor.signal_kind = "unsupported_tool_signal"
+                streams.unsupported.append(anchor)
+        return streams
 
 
 class DangerousFunctionLocator:
@@ -97,6 +148,11 @@ class DangerousFunctionLocator:
         (r"SELECT\s+.*\+", "sql_concat", "sql_injection", "sql", 0.65),
         (r"open\s*\(.*request\.", "open", "path_traversal", "file", 0.72),
         (r"send_file\s*\(", "send_file", "path_traversal", "file", 0.55),
+        (r"(?<!\.)\b(system|exec|shell_exec|passthru|popen)\s*\(", "system", "command_injection", "command", 0.58),
+        (r"Runtime\.getRuntime\(\)\.exec\s*\(", "Runtime.getRuntime().exec", "command_injection", "command", 0.62),
+        (r"\bProcessBuilder\s*\(", "ProcessBuilder", "command_injection", "command", 0.58),
+        (r"\bexec\.Command\s*\(", "exec.Command", "command_injection", "command", 0.62),
+        (r"\b(mysqli_query|pg_query)\s*\(", "database_query", "sql_injection", "sql", 0.58),
     ]
 
     SUFFIX_LANGUAGE = {
@@ -112,12 +168,16 @@ class DangerousFunctionLocator:
         ".h": "C/C++",
         ".hpp": "C++",
         ".go": "Go",
+        ".java": "Java",
+        ".php": "PHP",
         ".rs": "Rust",
     }
 
-    def __init__(self, rules_loader: RulesLoader | None = None) -> None:
+    def __init__(self, rules_loader: RulesLoader | None = None, path_policy: PathPolicy | None = None) -> None:
         self.rules_loader = rules_loader or RulesLoader()
+        self.path_policy = path_policy or PathPolicy()
         self.normalizer = VulnerabilityTypeNormalizer()
+        self.cpp_indexer = CppFunctionIndexer()
         self.last_suppressed_counts: dict[str, int] = {}
 
     def locate(
@@ -134,7 +194,7 @@ class DangerousFunctionLocator:
         anchors.extend(self._from_tools(target, tool_results, boundary_hints))
         merged = self._merge([self._enrich_anchor(anchor) for anchor in anchors])
         filtered = self._filter_and_rank(merged, budget, strategy)
-        return filtered[: budget.max_anchors] if budget else filtered
+        return filtered
 
     def _from_rules(
         self,
@@ -160,26 +220,24 @@ class DangerousFunctionLocator:
             ".cxx": cpp_merged,
             ".h": cpp_merged,
             ".hpp": cpp_merged,
+            ".go": [],
+            ".java": [],
+            ".php": [],
         }
-        # Load parser entry patterns for C/C++ projects
-        parser_patterns = rules.get("cpp.parser_patterns", {})
         common_rules = [
             {"pattern": pattern, "api": api, "vuln_type": vuln_type, "category": category, "confidence": confidence}
             for pattern, api, vuln_type, category, confidence in self.COMMON_PATTERNS
         ]
-        # Directories to skip during anchor collection (test code, build artifacts)
-        SKIP_DIRS = {"tests", "test", "__tests__", "__test__", "testing", "fuzz", "build", ".git"}
         for path in target.rglob("*"):
             if not path.is_file() or path.suffix.lower() not in self.SUFFIX_LANGUAGE or ".git" in path.parts:
                 continue
-            # Skip test/build directories
-            if any(d in SKIP_DIRS for d in path.parts):
+            rel = normalize_path(path, target)
+            if not self.path_policy.include_source(rel):
                 continue
             try:
                 lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
             except OSError:
                 continue
-            rel = normalize_path(path, target)
             suffix = path.suffix.lower()
             file_rules = grouped_rules.get(suffix, []) + common_rules
             for index, line in enumerate(lines, start=1):
@@ -234,10 +292,54 @@ class DangerousFunctionLocator:
                 anchors.extend(self._clang_tidy_anchors(target, result, hints))
             elif result.tool == "gosec" and isinstance(result.raw, dict):
                 anchors.extend(self._gosec_anchors(target, result))
+            elif result.tool == "codeql":
+                anchors.extend(self._codeql_anchors(target, result, hints))
             elif result.tool in {"npm-audit", "pip-audit", "cargo-audit", "osv-scanner", "trivy"}:
                 anchors.extend(self._dependency_anchors(result))
             elif result.tool == "gitleaks" and isinstance(result.raw, list):
                 anchors.extend(self._secret_anchors(result))
+        return anchors
+
+    def _codeql_anchors(
+        self,
+        target: Path,
+        result: ToolResult,
+        boundary_hints: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> list[DangerousFunction]:
+        hints = boundary_hints or {}
+        anchors: list[DangerousFunction] = []
+        artifact_refs = self._artifact_refs(result)
+        for item in result.findings:
+            file_path = self._relative_tool_path(target, str(item.get("file") or item.get("path") or ""))
+            line = self._int(item.get("line"), 1)
+            rule_id = str(item.get("rule_id") or "codeql")
+            message = str(item.get("message") or "CodeQL finding")
+            suffix = Path(file_path).suffix.lower()
+            code_flow = item.get("code_flow") if isinstance(item.get("code_flow"), list) else []
+            evidence = [message]
+            if code_flow:
+                evidence.append(f"codeql_path_steps={len(code_flow)}")
+            anchors.append(
+                DangerousFunction(
+                    id=self._id(file_path, line, rule_id),
+                    file_path=file_path,
+                    line_start=line,
+                    function_name=self._nearest_function(file_path, line, hints),
+                    dangerous_api=rule_id,
+                    category="tool",
+                    snippet=message[:500],
+                    language=self.SUFFIX_LANGUAGE.get(suffix, ""),
+                    kind="tool_finding",
+                    rule_id=rule_id,
+                    confidence=0.78 if code_flow else 0.68,
+                    source=str(item.get("source") or ""),
+                    sink=str(item.get("sink") or rule_id),
+                    evidence=evidence,
+                    tool_run_refs=[result.run_id],
+                    artifact_refs=artifact_refs,
+                    tool="codeql",
+                )
+            )
         return anchors
 
     def _semgrep_anchors(self, result: ToolResult) -> list[DangerousFunction]:
@@ -520,6 +622,8 @@ class DangerousFunctionLocator:
             if not path.is_file() or path.suffix.lower() not in self.SUFFIX_LANGUAGE or ".git" in path.parts:
                 continue
             rel = normalize_path(path, target)
+            if not self.path_policy.include_source(rel):
+                continue
             hints[rel] = self._extract_boundaries(path)
         return hints
 
@@ -529,7 +633,7 @@ class DangerousFunctionLocator:
             return self._python_boundaries(path)
         if suffix in {".js", ".jsx", ".ts", ".tsx"}:
             return self._js_boundaries(path)
-        if suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
+        if suffix in CPP_SUFFIXES:
             return self._cpp_boundaries(path)
         return []
 
@@ -593,46 +697,16 @@ class DangerousFunctionLocator:
         return output
 
     def _cpp_boundaries(self, path: Path) -> list[dict[str, Any]]:
-        ctags = shutil.which("ctags")
-        if ctags:
-            try:
-                if ctags == "docker-exec-sandbox-ctags":
-                    sandbox_path = str(path).replace("\\", "/")
-                    for host_pfx, sbx_pfx in [("/app/", "/workspace/")]:
-                        if sandbox_path.startswith(host_pfx):
-                            sandbox_path = sbx_pfx + sandbox_path[len(host_pfx):]
-                            break
-                    proc = subprocess.run(
-                        ["docker", "exec", os.getenv("AUDIT_SANDBOX_CONTAINER", "agentic-code-audit-sandbox"), "ctags", "-x", "--c-kinds=f", sandbox_path],
-                        text=True, encoding="utf-8", errors="replace",
-                        capture_output=True, timeout=10, check=False,
-                    )
-                else:
-                    proc = subprocess.run(
-                        [ctags, "-x", "--c-kinds=f", str(path)],
-                        text=True, encoding="utf-8", errors="replace",
-                        capture_output=True, timeout=10, check=False,
-                    )
-            except (OSError, subprocess.TimeoutExpired):
-                proc = None
-            if proc and proc.returncode == 0:
-                output: list[dict[str, Any]] = []
-                for line in proc.stdout.splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2].isdigit():
-                        output.append({"name": parts[0], "start": int(parts[2]), "end": int(parts[2]) + 40})
-                if output:
-                    return output
-        try:
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            return []
-        output = []
-        for index, line in enumerate(lines, start=1):
-            match = re.search(r"(?:[\w:<>\*&]+\s+)+([A-Za-z_~][A-Za-z0-9_:~]*)\s*\([^;{}]*\)\s*(?:\{|$)", line)
-            if match:
-                output.append({"name": match.group(1).split("::")[-1], "start": index, "end": min(len(lines), index + 50)})
-        return output
+        return [
+            {
+                "name": boundary.name,
+                "start": boundary.line_start,
+                "end": boundary.line_end,
+                "signature": boundary.signature,
+                "parameters": boundary.parameters,
+            }
+            for boundary in self.cpp_indexer.boundaries_for_file(path)
+        ]
 
     def _nearest_function(self, rel_path: str, line_number: int, boundary_hints: dict[str, list[dict[str, Any]]]) -> str:
         for item in boundary_hints.get(rel_path, []):
@@ -704,13 +778,16 @@ class DangerousFunctionLocator:
         budget: AuditBudget | None,
         strategy: MiningStrategy | None = None,
     ) -> list[DangerousFunction]:
-        suppressed = {"config": 0, "weak_signal": 0}
+        suppressed = {"config": 0, "weak_signal": 0, "path_policy": 0}
         output: list[DangerousFunction] = []
         for anchor in anchors:
+            if anchor.risk_domain == "source_code" and not self.path_policy.include_source(anchor.file_path):
+                suppressed["path_policy"] += 1
+                continue
             if strategy and self._is_dismissed_by_strategy(anchor, strategy):
                 suppressed["strategy_dismissed"] = suppressed.get("strategy_dismissed", 0) + 1
                 continue
-            if budget and not budget.enable_config_audit and anchor.anchor_category == "supply_chain_config":
+            if anchor.anchor_category == "supply_chain_config":
                 suppressed["config"] += 1
                 continue
             if budget and anchor.weak_signal and anchor.confidence < budget.weak_signal_min_confidence:
@@ -794,6 +871,10 @@ class SliceAnalyzer:
 
     def __init__(self, rules_loader: RulesLoader | None = None) -> None:
         self.rules_loader = rules_loader or RulesLoader()
+        self.variable_flow = VariableFlowAnalyzer()
+        self.graph_builder = EvidenceGraphBuilder()
+        self.interprocedural_slicer = InterproceduralSlicer()
+        self.cpp_indexer = CppFunctionIndexer()
         self._init_patterns()
 
     def _init_patterns(self) -> None:
@@ -824,6 +905,9 @@ class SliceAnalyzer:
             r"\bfread\s*\(",
             r"\brecv\s*\(",
             r"\bgetenv\s*\(",
+            r"\bURL\.Query\s*\(",
+            r"\bFormValue\s*\(",
+            r"\bgetParameter\s*\(",
         ]
 
     @staticmethod
@@ -847,10 +931,10 @@ class SliceAnalyzer:
         budget: AuditBudget | None = None,
         strategy: MiningStrategy | None = None,
     ) -> list[ProgramSlice]:
+        _ = budget
         slices: list[ProgramSlice] = []
-        max_slices = budget.max_slices if budget else 160
         ordered_anchors = self._order_anchors(dangerous_functions, strategy)
-        for anchor in ordered_anchors[:max_slices]:
+        for anchor in ordered_anchors:
             if anchor.kind in self.STATIC_KINDS:
                 slices.append(self._static_slice(anchor))
                 continue
@@ -859,24 +943,97 @@ class SliceAnalyzer:
                 lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
             except OSError:
                 continue
-            start, end = self._bounds_for_file(path, lines, anchor.line_start)
+            file_suffix = path.suffix.lower()
+            cpp_boundary = self.cpp_indexer.boundary_at(path, anchor.line_start, anchor.file_path) if file_suffix in CPP_SUFFIXES else None
+            semantic_summary = self._semantic_function_at(anchor, semantic_index)
+            if cpp_boundary:
+                anchor.function_name = cpp_boundary.name
+                start, end = cpp_boundary.line_start, cpp_boundary.line_end
+            elif semantic_summary:
+                anchor.function_name = semantic_summary.name
+                start = semantic_summary.line_start
+                end = semantic_summary.line_end or self._bounds_for_file(path, lines, anchor.line_start)[1]
+            else:
+                start, end = self._bounds_for_file(path, lines, anchor.line_start)
             context_lines = [(idx, lines[idx - 1]) for idx in range(start, min(end, len(lines)) + 1)]
             context = "\n".join(f"{idx}: {text}" for idx, text in context_lines)
-            source = self._infer_source(context)
-            # Tool-verified findings (cppcheck, clang-tidy) may not match our web/Python-centric
-            # source patterns.  Fall back to a tool-attributed source so downstream validators
-            # don't discard real C/C++ bugs just because the "source" looks unfamiliar.
-            if not source and anchor.tool_run_refs:
-                source = f"tool_verified({anchor.tool})"
+            inferred_source = self._infer_source(context)
+            source = anchor.source or ""
             guards = [text.strip() for _, text in context_lines if re.search(r"\b(if|while|for|switch|case|assert)\b", text)]
             sanitizers = [text.strip() for _, text in context_lines if self._has_any(text, self.SANITIZER_PATTERNS)]
             definitions = [text.strip() for _, text in context_lines if re.search(r"\b\w+\s*=\s*.+", text)]
             sink_line = lines[anchor.line_start - 1] if 1 <= anchor.line_start <= len(lines) else anchor.snippet
             sink_args = self._extract_args(sink_line)
-            parameters = self._infer_parameters(lines, start, end)
+            parameters = cpp_boundary.parameters if cpp_boundary else self._infer_parameters(lines, start, end)
+            variable_flow = self.variable_flow.analyze(
+                path,
+                lines,
+                start=start,
+                end=end,
+                sink_line=anchor.line_start,
+                sink=anchor.sink or anchor.dangerous_api,
+            )
+            interproc = self.interprocedural_slicer.analyze(
+                function_name=anchor.function_name,
+                file_path=anchor.file_path,
+                sink=anchor.sink or anchor.dangerous_api,
+                variable_flow_status=variable_flow.status,
+                source_variables=list(variable_flow.source_variables),
+                source=variable_flow.source,
+                semantic_index=semantic_index,
+            )
+            summary_source = interproc.to_dict() if interproc.linked else self._resolve_parameter_source(anchor, variable_flow, semantic_index)
+            if summary_source:
+                variable_flow.status = "propagated"
+                variable_flow.source = str(summary_source.get("source", ""))
+                variable_flow.steps = [
+                    FlowStep(
+                        int(summary_source.get("line") or anchor.line_start),
+                        "source",
+                        str(summary_source.get("source", "")),
+                        str(summary_source.get("argument", "")),
+                    ),
+                    *variable_flow.steps,
+                ]
+                variable_flow.gaps = [gap for gap in variable_flow.gaps if gap != "caller_source_not_resolved"]
+                definitions.append(
+                    "[summary] "
+                    f"{summary_source.get('caller', 'caller')} passes {summary_source.get('argument', '')} "
+                    f"to {anchor.function_name}.{summary_source.get('parameter', '')}"
+                )
+            if variable_flow.linked:
+                source = variable_flow.source
+            elif variable_flow.status == "parameter_flow":
+                source = self._parameter_source_label(variable_flow)
+            elif anchor.source:
+                source = anchor.source
+
+            function_summary: dict[str, Any] = {}
+            backward_slice: dict[str, Any] = {}
+            cpp_missing_guards: list[str] = []
+            if semantic_summary:
+                function_summary = asdict(semantic_summary)
+            if cpp_boundary:
+                cpp_summary = self.cpp_indexer.summarize(cpp_boundary, lines)
+                function_summary = asdict(cpp_summary)
+                cpp_backward_slice = self.cpp_indexer.backward_slice(
+                    cpp_boundary,
+                    lines,
+                    sink_line=anchor.line_start,
+                    sink=anchor.sink or anchor.dangerous_api,
+                )
+                backward_slice = cpp_backward_slice.to_dict()
+                for field_read in cpp_backward_slice.field_reads[:8]:
+                    definitions.append(f"[field_read] {field_read}")
+                for item in cpp_backward_slice.dependencies[:8]:
+                    definitions.append(f"[backward] {item.get('symbol')} <- {item.get('expression')} (line {item.get('line')})")
+                for missing in cpp_backward_slice.missing_guards:
+                    if missing not in cpp_missing_guards:
+                        cpp_missing_guards.append(missing)
+                if cpp_backward_slice.sink_args:
+                    sink_args = list(dict.fromkeys([*sink_args, *cpp_backward_slice.sink_args]))[:10]
 
             # --- C/C++ local data-flow enrichment (Phase D) ---
-            file_suffix = path.suffix.lower()
             if file_suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"} and hasattr(self, "GUARD_PATTERNS"):
                 df = CppLocalDataFlowAnalyzer()
                 source_vars = [source] if source else []
@@ -895,7 +1052,16 @@ class SliceAnalyzer:
                 if df_sink_args:
                     sink_args = list(dict.fromkeys(sink_args + df_sink_args))[:10]
 
+            interproc_dict = interproc.to_dict()
+            if interproc_dict:
+                function_summary["interprocedural"] = interproc_dict
+
             missing_guards = self._missing_guards(anchor, source, guards, sanitizers)
+            for missing in cpp_missing_guards:
+                if missing not in missing_guards:
+                    missing_guards.append(missing)
+            if inferred_source and not source and "source_sink_variable_not_linked" not in variable_flow.gaps:
+                variable_flow.gaps.append("source_context_not_linked_to_sink")
             # Add parser-entry context for C/C++
             if hasattr(self, "parser_entry_patterns"):
                 for pe_pat in self.parser_entry_patterns:
@@ -903,12 +1069,40 @@ class SliceAnalyzer:
                         if "parser entry" not in missing_guards:
                             missing_guards.append(f"parser_entry_matched:{pe_pat}")
                         break
-            call_chain = self._call_chain(anchor, semantic_index)
-            data_flow = [item for item in [source or "unknown_input", anchor.function_name or anchor.file_path, anchor.sink] if item]
+            call_chain = interproc.call_chain or self._call_chain(anchor, semantic_index)
+            data_flow = [
+                f"{step.operation}:{step.variable}@{step.line}"
+                for step in variable_flow.steps
+            ]
             excerpt = "\n".join(text for _, text in context_lines)
+            slice_id = self._id(anchor.id, excerpt)
+            analysis_backends = ["local_dataflow", "semantic_index"]
+            if anchor.tool == "codeql":
+                analysis_backends.append("codeql")
+            if backward_slice:
+                analysis_backends.append("sink_backward_slice")
+            analysis_backends.extend(item for item in interproc.backends if item not in analysis_backends)
+            evidence_graph = self.graph_builder.build(
+                EvidenceGraphInput(
+                    graph_id=slice_id,
+                    target=target,
+                    anchor=anchor,
+                    semantic_index=semantic_index,
+                    variable_flow=variable_flow,
+                    call_chain=call_chain,
+                    guards=guards[:10],
+                    sanitizers=sanitizers[:10],
+                    missing_guards=missing_guards,
+                    sink_args=sink_args[:8],
+                    context=context,
+                    function_summary=function_summary,
+                    backward_slice=backward_slice,
+                    interprocedural_flow=interproc_dict,
+                )
+            )
             slices.append(
                 ProgramSlice(
-                    id=self._id(anchor.id, excerpt),
+                    id=slice_id,
                     dangerous_function_id=anchor.id,
                     file_path=anchor.file_path,
                     line_start=anchor.line_start,
@@ -935,9 +1129,43 @@ class SliceAnalyzer:
                     anchor_category=anchor.anchor_category,
                     anchor_tool=anchor.tool,
                     anchor_confidence=anchor.confidence,
+                    signal_kind=anchor.signal_kind or "code_sink",
+                    flow_status=variable_flow.status,
+                    slice_status=evidence_graph.status,
+                    source_variables=variable_flow.source_variables,
+                    sink_variables=variable_flow.sink_variables,
+                    taint_path=[step.to_dict() for step in variable_flow.steps],
+                    flow_gaps=variable_flow.gaps,
+                    evidence_graph=evidence_graph,
+                    function_summary=function_summary,
+                    backward_slice=backward_slice,
+                    call_paths=interproc.caller_paths,
+                    entry_points=interproc.entry_points,
+                    interprocedural_flow=interproc_dict,
+                    analysis_backends=list(dict.fromkeys(analysis_backends)),
                 )
             )
         return slices
+
+    @staticmethod
+    def _parameter_source_label(variable_flow: VariableFlowResult) -> str:
+        if variable_flow.source:
+            return variable_flow.source
+        if variable_flow.source_variables:
+            return f"parameter:{variable_flow.source_variables[0]}"
+        for step in variable_flow.steps:
+            if step.operation == "parameter" and step.variable:
+                return f"parameter:{step.variable}"
+        return ""
+
+    def build_static_slices(
+        self,
+        anchors: list[DangerousFunction],
+        *,
+        limit: int | None = None,
+    ) -> list[ProgramSlice]:
+        selected = anchors[:limit] if limit is not None else anchors
+        return [self._static_slice(anchor) for anchor in selected]
 
     def _order_anchors(
         self,
@@ -968,21 +1196,32 @@ class SliceAnalyzer:
 
     def _static_slice(self, anchor: DangerousFunction) -> ProgramSlice:
         context = "\n".join(anchor.evidence + [anchor.snippet])
+        slice_id = self._id(anchor.id, context)
+        evidence_graph = self.graph_builder.build(
+            EvidenceGraphInput(
+                graph_id=slice_id,
+                target=Path("."),
+                anchor=anchor,
+                semantic_index=SemanticIndex(),
+                context=context,
+                static_evidence=True,
+            )
+        )
         source_by_kind = {
             "dependency_vulnerability": "dependency manifest",
             "secret_leak": "source literal",
             "configuration_security": "configuration file",
         }
         return ProgramSlice(
-            id=self._id(anchor.id, context),
+            id=slice_id,
             dangerous_function_id=anchor.id,
             file_path=anchor.file_path,
             line_start=anchor.line_start,
             function_name=anchor.function_name,
             source=source_by_kind.get(anchor.kind, "static evidence"),
             sink=anchor.sink or anchor.dangerous_api,
-            call_chain=[anchor.tool, anchor.function_name or anchor.file_path, anchor.dangerous_api],
-            data_flow=[anchor.tool, anchor.function_name or anchor.file_path, anchor.dangerous_api],
+            call_chain=[],
+            data_flow=[],
             guards=[],
             missing_guards=[],
             sanitizers=[],
@@ -997,6 +1236,11 @@ class SliceAnalyzer:
             anchor_category=anchor.anchor_category,
             anchor_tool=anchor.tool,
             anchor_confidence=anchor.confidence,
+            signal_kind=anchor.signal_kind,
+            flow_status="static_evidence",
+            slice_status=evidence_graph.status,
+            evidence_graph=evidence_graph,
+            analysis_backends=[anchor.tool or "static_tool"],
         )
 
     def _bounds_for_file(self, path: Path, lines: list[str], line_number: int) -> tuple[int, int]:
@@ -1007,6 +1251,8 @@ class SliceAnalyzer:
             bounds = self._js_ts_bounds(path, line_number, lines)
         elif suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
             bounds = self._cpp_bounds(path, line_number, lines)
+        elif suffix in {".go", ".java", ".php"}:
+            bounds = self._generic_bounds(line_number, lines)
         else:
             bounds = None
         if bounds:
@@ -1057,52 +1303,38 @@ class SliceAnalyzer:
         return None
 
     def _cpp_bounds(self, path: Path, line_number: int, lines: list[str]) -> tuple[int, int] | None:
-        # Try ctags: host first, then sandbox docker exec
-        ctags = shutil.which("ctags")
-        if not ctags:
-            try:
-                proc = subprocess.run(
-                    ["docker", "exec", os.getenv("AUDIT_SANDBOX_CONTAINER", "agentic-code-audit-sandbox"), "which", "ctags"],
-                    text=True, capture_output=True, timeout=5, check=False,
-                )
-                if proc.returncode == 0 and proc.stdout.strip():
-                    ctags = "docker-exec-sandbox-ctags"
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        if ctags:
-            try:
-                if ctags == "docker-exec-sandbox-ctags":
-                    sandbox_path = str(path).replace("\\", "/")
-                    for host_pfx, sbx_pfx in [("/app/", "/workspace/")]:
-                        if sandbox_path.startswith(host_pfx):
-                            sandbox_path = sbx_pfx + sandbox_path[len(host_pfx):]
-                            break
-                    proc = subprocess.run(
-                        ["docker", "exec", os.getenv("AUDIT_SANDBOX_CONTAINER", "agentic-code-audit-sandbox"), "ctags", "-x", "--c-kinds=f", sandbox_path],
-                        text=True, encoding="utf-8", errors="replace",
-                        capture_output=True, timeout=10, check=False,
-                    )
-                else:
-                    proc = subprocess.run(
-                        [ctags, "-x", "--c-kinds=f", str(path)],
-                        text=True, encoding="utf-8", errors="replace",
-                        capture_output=True, timeout=10, check=False,
-                    )
-            except (OSError, subprocess.TimeoutExpired):
-                proc = None
-            if proc and proc.returncode == 0:
-                for line in proc.stdout.splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2].isdigit():
-                        start = int(parts[2])
-                        end = start + 50
-                        if start <= line_number <= end:
-                            return start, min(len(lines), end)
+        boundary = self.cpp_indexer.boundary_at(path, line_number)
+        if boundary:
+            return boundary.line_start, min(len(lines), boundary.line_end)
         for index in range(line_number - 1, max(-1, line_number - 120), -1):
             line = lines[index]
             if re.search(r"(?:[\w:<>\*&]+\s+)+[A-Za-z_~][A-Za-z0-9_:~]*\s*\([^;{}]*\)\s*(?:\{|$)", line):
                 return index + 1, min(len(lines), line_number + 40)
         return None
+
+    def _generic_bounds(self, line_number: int, lines: list[str]) -> tuple[int, int] | None:
+        start = None
+        for index in range(line_number, 0, -1):
+            text = lines[index - 1]
+            if re.search(r"\b(func|function)\s+[A-Za-z_$][\w$]*\s*\(", text) or re.search(
+                r"^\s*(?:(?:public|private|protected|static|final|synchronized)\s+)*[\w<>\[\], ?]+\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*(?:throws\s+[^{]+)?\{?",
+                text,
+            ):
+                start = index
+                break
+        if start is None:
+            return None
+        depth = 0
+        opened = False
+        for index in range(start, len(lines) + 1):
+            text = lines[index - 1]
+            if "{" in text:
+                opened = True
+            depth += text.count("{")
+            depth -= text.count("}")
+            if opened and depth <= 0:
+                return start, index
+        return start, min(len(lines), max(start, line_number + 20))
 
     def _infer_source(self, context: str) -> str:
         for pattern in self.SOURCE_PATTERNS:
@@ -1144,17 +1376,164 @@ class SliceAnalyzer:
             missing.append("length or bounds check")
         return list(dict.fromkeys(missing))[:4]
 
+    def _semantic_function_at(self, anchor: DangerousFunction, semantic_index: SemanticIndex) -> FunctionSummary | None:
+        for summary in semantic_index.functions:
+            if summary.file_path != anchor.file_path or summary.line_end is None:
+                continue
+            if summary.line_start <= anchor.line_start <= summary.line_end:
+                return summary
+        if anchor.function_name:
+            for summary in semantic_index.functions:
+                if summary.file_path == anchor.file_path and self._same_function(summary.name, anchor.function_name):
+                    return summary
+        return None
+
     def _call_chain(self, anchor: DangerousFunction, semantic_index: SemanticIndex) -> list[str]:
-        for route in semantic_index.routes:
-            if route.file_path == anchor.file_path and route.line_start <= anchor.line_start:
-                return [f"{route.method} {route.route}", route.handler, anchor.function_name or anchor.file_path, anchor.sink]
-        callers = [
-            item.name
-            for item in semantic_index.functions
-            if item.file_path == anchor.file_path and item.name and item.name != anchor.function_name
-        ][:3]
-        chain = callers + [anchor.function_name or anchor.file_path, anchor.sink]
+        function = anchor.function_name or anchor.file_path
+        edges = list(getattr(semantic_index, "call_edges", []) or [])
+        caller_paths = self._caller_paths(function, anchor.file_path, edges, max_depth=4)
+        routes = [route for route in semantic_index.routes if route.file_path == anchor.file_path]
+        for route in routes:
+            route_label = f"{route.method} {route.route}"
+            if self._same_function(route.handler, function):
+                return [route_label, function, anchor.sink]
+            for path in caller_paths:
+                if path and self._same_function(path[0], route.handler):
+                    return [route_label, *path, anchor.sink]
+        if caller_paths:
+            return [*caller_paths[0], anchor.sink]
+        for route in routes:
+            if route.line_start <= anchor.line_start:
+                return [f"{route.method} {route.route}", route.handler, function, anchor.sink]
+        callees = [
+            edge.callee
+            for edge in edges
+            if edge.file_path == anchor.file_path and self._same_function(edge.caller, function)
+        ]
+        chain = [function, *(item for item in callees[:3] if item != anchor.sink), anchor.sink]
         return [item for item in chain if item]
+
+    def _caller_paths(self, function: str, file_path: str, edges: list[Any], *, max_depth: int = 4) -> list[list[str]]:
+        paths: list[list[str]] = []
+        queue: list[list[str]] = [[function]]
+        seen: set[str] = {function}
+        while queue and len(paths) < 8:
+            path = queue.pop(0)
+            current = path[0]
+            for edge in edges:
+                if edge.file_path != file_path or not self._same_function(edge.callee, current):
+                    continue
+                caller = edge.caller
+                if not caller or caller in seen:
+                    continue
+                next_path = [caller, *path]
+                paths.append(next_path)
+                seen.add(caller)
+                if len(next_path) <= max_depth:
+                    queue.append(next_path)
+        paths.sort(key=len)
+        return paths
+
+    def _resolve_parameter_source(
+        self,
+        anchor: DangerousFunction,
+        variable_flow: VariableFlowResult,
+        semantic_index: SemanticIndex,
+    ) -> dict[str, Any]:
+        if variable_flow.status != "parameter_flow" or not anchor.function_name:
+            return {}
+        parameters = [
+            item.removeprefix("parameter:")
+            for item in [*variable_flow.source_variables, variable_flow.source]
+            if item
+        ]
+        for parameter in parameters:
+            result = self._resolve_parameter_argument(
+                anchor.function_name,
+                parameter,
+                anchor.file_path,
+                semantic_index,
+                depth=4,
+                seen=set(),
+            )
+            if result:
+                return result
+        return {}
+
+    def _resolve_parameter_argument(
+        self,
+        function: str,
+        parameter: str,
+        file_path: str,
+        semantic_index: SemanticIndex,
+        *,
+        depth: int,
+        seen: set[tuple[str, str]],
+    ) -> dict[str, Any]:
+        key = (function, parameter)
+        if depth <= 0 or key in seen:
+            return {}
+        seen.add(key)
+        params = self._semantic_parameters(function, file_path, semantic_index)
+        if parameter not in params and len(params) != 1:
+            return {}
+        parameter_index = params.index(parameter) if parameter in params else 0
+        for edge in getattr(semantic_index, "call_edges", []) or []:
+            if edge.file_path != file_path or not self._same_function(edge.callee, function):
+                continue
+            arguments = list(getattr(edge, "arguments", []) or [])
+            if parameter_index >= len(arguments):
+                continue
+            argument = arguments[parameter_index]
+            source = self._source_from_argument(argument)
+            if source:
+                return {
+                    "source": source,
+                    "argument": argument,
+                    "caller": edge.caller,
+                    "line": edge.line,
+                    "parameter": parameter,
+                }
+            caller_params = self._semantic_parameters(edge.caller, file_path, semantic_index)
+            for identifier in self._argument_identifiers(argument):
+                if identifier not in caller_params:
+                    continue
+                nested = self._resolve_parameter_argument(
+                    edge.caller,
+                    identifier,
+                    file_path,
+                    semantic_index,
+                    depth=depth - 1,
+                    seen=seen,
+                )
+                if nested:
+                    nested.setdefault("caller", edge.caller)
+                    return nested
+        return {}
+
+    def _semantic_parameters(self, function: str, file_path: str, semantic_index: SemanticIndex) -> list[str]:
+        for summary in semantic_index.functions:
+            if summary.file_path == file_path and self._same_function(summary.name, function):
+                return list(summary.parameters)
+        return []
+
+    def _source_from_argument(self, argument: str) -> str:
+        return argument.strip() if argument and self._has_any(argument, self.SOURCE_PATTERNS) else ""
+
+    def _argument_identifiers(self, argument: str) -> list[str]:
+        return list(dict.fromkeys(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", argument or "")))
+
+    def _same_function(self, left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        left_norm = left.replace(" ", "")
+        right_norm = right.replace(" ", "")
+        return (
+            left_norm == right_norm
+            or left_norm.split("::")[-1] == right_norm.split("::")[-1]
+            or left_norm.split("->")[-1] == right_norm.split("::")[-1]
+            or right_norm.split("::")[-1] == left_norm.split("->")[-1]
+        )
 
     def _deterministic_summary(
         self,
@@ -1286,10 +1665,9 @@ class CandidateGenerator:
         tool_slices: list[ProgramSlice] = []
         rule_slices: list[ProgramSlice] = []
         self.llm_calls_used = 0
-        max_candidates = budget.max_candidates if budget else 200
         max_llm_calls = budget.max_llm_calls if budget else 999_999
 
-        for program_slice in slices[:max_candidates]:
+        for program_slice in slices:
             # Slices with tool evidence → LLM path; pure rule matches → fast path
             if program_slice.anchor_tool == "rules" and not program_slice.tool_run_refs:
                 rule_slices.append(program_slice)
@@ -1313,16 +1691,16 @@ class CandidateGenerator:
                 batch_size = max(3, min(4, 8))
                 for i in range(0, len(group), batch_size):
                     batches.append(group[i : i + batch_size])
-            if len(batches) > max_llm_calls:
-                batches = batches[:max_llm_calls]
+            llm_batches = batches[:max_llm_calls]
+            fallback_batches = batches[max_llm_calls:]
 
             # Parallelize LLM batch calls (I/O-bound — ThreadPoolExecutor)
             batch_results: list[tuple[int, list[dict[str, Any]]]] = []
-            if len(batches) > 1 and llm_client.enabled:
-                with ThreadPoolExecutor(max_workers=min(4, len(batches))) as ex:
+            if len(llm_batches) > 1 and llm_client.enabled:
+                with ThreadPoolExecutor(max_workers=min(4, len(llm_batches))) as ex:
                     future_to_idx = {
                         ex.submit(self._ask_llm_batch, batch, llm_client): i
-                        for i, batch in enumerate(batches)
+                        for i, batch in enumerate(llm_batches)
                     }
                     for future in as_completed(future_to_idx):
                         idx = future_to_idx[future]
@@ -1333,13 +1711,18 @@ class CandidateGenerator:
                 # Sort back to original order
                 batch_results.sort(key=lambda x: x[0])
             else:
-                for i, batch in enumerate(batches):
+                for i, batch in enumerate(llm_batches):
                     batch_results.append((i, self._ask_llm_batch(batch, llm_client)))
 
-            for batch_idx, (batch, llm_result) in enumerate(zip(batches, [r[1] for r in batch_results])):
+            for batch_idx, (batch, llm_result) in enumerate(zip(llm_batches, [r[1] for r in batch_results])):
                 for slice_idx, program_slice in enumerate(batch):
                     raw = llm_result[slice_idx] if slice_idx < len(llm_result) else None
                     candidate = self._candidate_from_raw(program_slice, raw) if raw else self._fallback_candidate(program_slice)
+                    candidates.append(candidate)
+            for batch in fallback_batches:
+                for program_slice in batch:
+                    candidate = self._fallback_candidate(program_slice)
+                    candidate.assumptions.append("llm_generation_budget_exhausted")
                     candidates.append(candidate)
 
         # LLM quality gate — review suspicious candidates (tool-based + low-confidence rule-based)
@@ -1349,7 +1732,25 @@ class CandidateGenerator:
             with self._llm_calls_lock:
                 self.llm_calls_used += self.reviewer.llm_calls_used
 
-        return candidates[:max_candidates]
+        return candidates
+
+    def generate_static(
+        self,
+        slices: list[ProgramSlice],
+        budget: AuditBudget | None = None,
+    ) -> list[VulnerabilityCandidate]:
+        """Convert static evidence to candidates without source-code LLM review."""
+        _ = budget
+        candidates: list[VulnerabilityCandidate] = []
+        for program_slice in slices:
+            candidate = self._fallback_candidate(program_slice)
+            candidate.candidate_source = "tool"
+            candidate.signal_kind = program_slice.signal_kind
+            candidate.assumptions = [
+                item for item in candidate.assumptions if item != "fallback_candidate"
+            ]
+            candidates.append(candidate)
+        return candidates
 
     def _inc_llm_calls(self) -> None:
         with self._llm_calls_lock:
@@ -1368,7 +1769,7 @@ class CandidateGenerator:
             "include file, function, line, sink, trigger_condition, title, vulnerability_type, severity, description, "
             "trigger_conditions, evidence, missing_checks, assumptions, confidence, valid."
         )
-        user = json.dumps([slice_.__dict__ for slice_ in slices], ensure_ascii=False)
+        user = json.dumps([self._slice_payload(slice_) for slice_ in slices], ensure_ascii=False)
         response = llm_client.chat(prompt, user, timeout=45)
         if not getattr(response, "ok", False):
             return []
@@ -1384,6 +1785,28 @@ class CandidateGenerator:
             except json.JSONDecodeError:
                 return []
         return raw if isinstance(raw, list) else []
+
+    def _slice_payload(self, program_slice: ProgramSlice) -> dict[str, Any]:
+        payload = asdict(program_slice)
+        graph = payload.get("evidence_graph")
+        if isinstance(graph, dict):
+            payload["evidence_graph"] = {
+                "id": graph.get("id", ""),
+                "status": graph.get("status", ""),
+                "confidence": graph.get("confidence", 0.0),
+                "gaps": list(graph.get("gaps", []) or [])[:8],
+                "paths": [
+                    {
+                        "kind": path.get("kind", ""),
+                        "status": path.get("status", ""),
+                        "provenance": path.get("provenance", ""),
+                        "confidence": path.get("confidence", 0.0),
+                    }
+                    for path in list(graph.get("paths", []) or [])[:4]
+                    if isinstance(path, dict)
+                ],
+            }
+        return payload
 
     def _candidate_from_raw(self, program_slice: ProgramSlice, raw: dict[str, Any]) -> VulnerabilityCandidate:
         # Normalize C++ std:: prefixes before type normalization
@@ -1432,8 +1855,22 @@ class CandidateGenerator:
             validity=validity,
             llm_reasoning=str(raw.get("llm_reasoning") or ""),
             candidate_source="llm",
+            candidate_state=self._candidate_state(validity),
             invalid_reason=invalid_reason,
             risk_domain=risk_domain,
+            signal_kind=program_slice.signal_kind,
+            flow_status=program_slice.flow_status,
+            slice_status=program_slice.slice_status,
+            source_variables=list(program_slice.source_variables),
+            sink_variables=list(program_slice.sink_variables),
+            taint_path=list(program_slice.taint_path),
+            flow_gaps=list(program_slice.flow_gaps),
+            function_summary=dict(program_slice.function_summary),
+            backward_slice=dict(program_slice.backward_slice),
+            call_paths=[list(path) for path in program_slice.call_paths],
+            entry_points=list(program_slice.entry_points),
+            interprocedural_flow=dict(program_slice.interprocedural_flow),
+            analysis_backends=list(program_slice.analysis_backends),
         )
 
     @staticmethod
@@ -1495,9 +1932,33 @@ class CandidateGenerator:
             validity=validity,
             llm_reasoning=program_slice.llm_summary,
             candidate_source="rule",
+            candidate_state=self._candidate_state(validity),
             invalid_reason=invalid_reason,
             risk_domain=risk_domain,
+            signal_kind=program_slice.signal_kind,
+            flow_status=program_slice.flow_status,
+            slice_status=program_slice.slice_status,
+            source_variables=list(program_slice.source_variables),
+            sink_variables=list(program_slice.sink_variables),
+            taint_path=list(program_slice.taint_path),
+            flow_gaps=list(program_slice.flow_gaps),
+            function_summary=dict(program_slice.function_summary),
+            backward_slice=dict(program_slice.backward_slice),
+            call_paths=[list(path) for path in program_slice.call_paths],
+            entry_points=list(program_slice.entry_points),
+            interprocedural_flow=dict(program_slice.interprocedural_flow),
+            analysis_backends=list(program_slice.analysis_backends),
         )
+
+    @staticmethod
+    def _candidate_state(validity: str) -> str:
+        if validity == "valid":
+            return "candidate"
+        if validity == "needs_context":
+            return "needs_context"
+        if validity == "rejected":
+            return "rejected"
+        return "invalid"
 
     def _validate_candidate(self, program_slice: ProgramSlice, trigger_conditions: list[str]) -> tuple[bool, str, str]:
         """Return (valid, validity, invalid_reason)."""
@@ -1507,10 +1968,13 @@ class CandidateGenerator:
         # already verified the file, line, and check.  This prevents real C/C++ bugs from
         # being discarded just because we can't infer a "source" from regex patterns.
         has_tool_evidence = bool(program_slice.tool_run_refs)
+        has_static_context = program_slice.source in static_sources
+        has_linked_flow = program_slice.flow_status in {"direct", "propagated"}
+        has_entry_parameter_flow = program_slice.slice_status == "entry_parameter_flow"
         has_required_context = (
-            bool(program_slice.function_name)
-            or program_slice.source in static_sources
+            has_static_context
             or has_tool_evidence
+            or bool(program_slice.function_name and program_slice.source)
         )
         reasons: list[str] = []
         if not program_slice.file_path:
@@ -1520,10 +1984,24 @@ class CandidateGenerator:
         if not program_slice.sink:
             reasons.append("missing_sink")
         if not has_required_context:
-            if not program_slice.function_name:
+            if not program_slice.function_name and not has_static_context and not has_tool_evidence:
                 reasons.append("missing_function_name")
             if program_slice.source not in static_sources and not has_tool_evidence:
                 reasons.append("missing_source_or_static_context")
+        if (
+            program_slice.signal_kind == "code_sink"
+            and program_slice.flow_status
+            and not has_linked_flow
+            and not has_entry_parameter_flow
+            and not has_tool_evidence
+        ):
+            reasons.append("source_sink_flow_not_linked")
+        if (
+            program_slice.signal_kind == "code_sink"
+            and program_slice.slice_status == "parameter_flow_unresolved"
+            and not has_tool_evidence
+        ):
+            reasons.append("caller_source_unresolved")
         if not trigger_conditions:
             reasons.append("missing_trigger_condition")
         if self._is_unsupported_weak_cpp_candidate(program_slice):
@@ -1535,13 +2013,19 @@ class CandidateGenerator:
     def _is_unsupported_weak_cpp_candidate(self, program_slice: ProgramSlice) -> bool:
         if program_slice.anchor_tool != "rules":
             return False
-        if program_slice.anchor_category not in {"", "source_code"}:
+        if program_slice.signal_kind and program_slice.signal_kind != "code_sink":
             return False
         sink = (program_slice.sink or "").strip()
         if sink not in WEAK_CPP_APIS and program_slice.anchor_confidence >= 0.50:
             return False
         has_tool_evidence = bool(program_slice.tool_run_refs)
-        has_source_sink_guard = bool(program_slice.source and program_slice.sink and program_slice.missing_guards)
+        has_external_flow = program_slice.flow_status in {"direct", "propagated"} and not program_slice.source.startswith("parameter:")
+        has_source_sink_guard = bool(
+            has_external_flow
+            and program_slice.source
+            and program_slice.sink
+            and program_slice.missing_guards
+        )
         context = f"{program_slice.function_name} {program_slice.file_path}".lower()
         has_parser_context = any(token in context for token in ("read", "decode", "parse", "load", "writemetadata", "metadata"))
         has_combo_rule = (
@@ -1618,6 +2102,8 @@ class CandidateGenerator:
             ".cpp": "C++",
             ".cxx": "C++",
             ".go": "Go",
+            ".java": "Java",
+            ".php": "PHP",
             ".rs": "Rust",
         }.get(suffix, "unknown")
 
@@ -1626,26 +2112,25 @@ class CandidateGenerator:
 
 
 class LLMCandidateReviewer:
-    """LLM-powered quality gate for vulnerability candidates.
+    """Fail-closed LLM quality gate for source-code vulnerability candidates."""
 
-    Reviews candidates in batches, asking the LLM to distinguish real security
-    vulnerabilities from config-lint / best-practice / tool-noise findings.
-    Rejected candidates get valid=False so ClueAggregator drops them.
-    """
+    REVIEW_PROMPT = """You are a senior security auditor. Review each source-code vulnerability candidate.
 
-    REVIEW_PROMPT = """你是资深安全审计专家。请审查以下漏洞候选，判断它是否是一个**真实的安全漏洞**。
+Return only a JSON array with one item per input candidate:
+[
+  {
+    "candidate_id": "candidate id",
+    "verdict": "accept|reject|needs_more_context",
+    "reason": "short technical reason",
+    "missing_context": ["optional missing evidence"],
+    "evidence_refs": ["optional evidence ids"]
+  }
+]
 
-审查要点:
-1. 这个 sink 在该上下文中是否真的危险（能导致可利用的安全后果）？
-2. 这是**代码漏洞**还是**配置规范建议**？
-3. 如果候选的文件是 CI 配置（YAML JSON TOML），且 sink 是 lint 规则匹配，这是配置检查而非漏洞
-4. 如果是 dependency/package 相关的发现，检查是否有已知 CVE 或具体风险描述
-
-对每个候选输出 JSON 数组:
-[{"verdict": "confirmed|rejected", "reasoning": "简短理由"}]
-
-- confirmed: 这是一个需要关注的安全漏洞
-- rejected: 这是配置lint、代码风格、或不构成实际安全威胁的发现"""
+Use accept only when the candidate has a coherent Source -> Sink story and a concrete security impact.
+Use reject for best-practice, lint-only, unreachable, sanitized, or non-security findings.
+Use needs_more_context when the local slice is insufficient, the source/sink are not linked, or key evidence is missing.
+Do not upgrade weak evidence into a finding. Do not invent source, sink, reachability, or exploitability."""
 
     def __init__(self, llm_client: DeepSeekClient | None = None):
         self.llm_client = llm_client
@@ -1657,15 +2142,18 @@ class LLMCandidateReviewer:
         candidates: list[VulnerabilityCandidate],
         llm_client: DeepSeekClient,
     ) -> list[VulnerabilityCandidate]:
-        """Review a list of candidates. Returns the same list with invalid ones flagged."""
+        """Review source-code candidates and fail closed on LLM or schema errors."""
         if not self.llm_client:
             self.llm_client = llm_client
 
-        to_review = [c for c in candidates if self._needs_review(c)]
+        to_review = [candidate for candidate in candidates if self._needs_review(candidate)]
         if not to_review:
             return candidates
+        if not getattr(self.llm_client, "enabled", False) or not hasattr(self.llm_client, "chat"):
+            for candidate in to_review:
+                self._mark_needs_more_context(candidate, "llm_triage_unavailable", ["llm_client_disabled"])
+            return candidates
 
-        # Review in small batches (max 3 per call)
         self.llm_calls_used = 0
         for batch_start in range(0, len(to_review), 3):
             if self.llm_calls_used >= self.max_llm_calls:
@@ -1673,80 +2161,137 @@ class LLMCandidateReviewer:
             batch = to_review[batch_start : batch_start + 3]
             judgments = self._ask_llm(batch)
             for candidate, judgment in zip(batch, judgments):
-                verdict = str(judgment.get("verdict", "")).lower()
-                reasoning = str(judgment.get("reasoning", ""))
-                if verdict == "rejected":
-                    candidate.mark_invalid(f"llm_rejected({reasoning[:120]})" if reasoning else "llm_rejected")
-                elif verdict == "confirmed":
-                    # Boost confidence for LLM-confirmed candidates
-                    candidate.confidence = min(0.95, candidate.confidence + 0.08)
+                self._apply_judgment(candidate, judgment)
 
+        for candidate in to_review:
+            if not candidate.triage_verdict:
+                self._mark_needs_more_context(candidate, "llm_triage_budget_exhausted", ["triage_budget"])
         return candidates
 
     def _needs_review(self, candidate: VulnerabilityCandidate) -> bool:
-        """Only review the most suspicious candidates to minimize LLM calls."""
         if not candidate.valid:
             return False
-        vt = (candidate.vulnerability_type or "").lower()
-        # Only review supply_chain_config that have vague titles (likely config lint noise)
-        if vt == "supply_chain_config":
-            title = (candidate.title or "").lower()
-            noise_keywords = ["github-actions", "mutable", "dependabot", "workflow", "other"]
-            return any(kw in title for kw in noise_keywords)
-        # Only review dependency findings with no CVE reference
-        if vt == "dependency_vulnerability":
-            return not any("cve" in str(e).lower() for e in candidate.evidence)
-        return False
+        if candidate.signal_kind and candidate.signal_kind != "code_sink":
+            return False
+        risk_domain = candidate.risk_domain or risk_domain_for(VulnType.from_string(candidate.vulnerability_type)).value
+        return risk_domain == "source_code"
 
     def _ask_llm(self, candidates: list[VulnerabilityCandidate]) -> list[dict[str, Any]]:
-        """Ask LLM to review a batch of candidates."""
         self.llm_calls_used += 1
-        items = []
-        for i, c in enumerate(candidates):
-            items.append({
-                "index": i,
-                "title": c.title,
-                "type": c.vulnerability_type,
-                "file": c.file_path,
-                "line": c.line_start,
-                "sink": c.sink,
-                "source": c.source,
-                "function": c.function_name,
-                "description": (c.description or "")[:300],
-                "evidence": [str(e)[:200] for e in (c.evidence or [])[:3]],
-            })
-
-        prompt = self.REVIEW_PROMPT + "\n\n候选列表:\n" + json.dumps(items, ensure_ascii=False, indent=2)
+        items = [
+            {
+                "candidate_id": candidate.id,
+                "title": candidate.title,
+                "vulnerability_type": candidate.vulnerability_type,
+                "file": candidate.file_path,
+                "line": candidate.line_start,
+                "function": candidate.function_name,
+                "source": candidate.source,
+                "sink": candidate.sink,
+                "flow_status": candidate.flow_status,
+                "slice_status": candidate.slice_status,
+                "source_variables": candidate.source_variables[:6],
+                "sink_variables": candidate.sink_variables[:6],
+                "flow_gaps": candidate.flow_gaps[:6],
+                "description": (candidate.description or "")[:300],
+                "trigger_conditions": candidate.trigger_conditions[:6],
+                "evidence": [str(item)[:240] for item in (candidate.evidence or [])[:6]],
+                "evidence_refs": candidate.evidence_refs[:8],
+                "has_tool_evidence": self._has_tool_evidence(candidate),
+            }
+            for candidate in candidates
+        ]
+        prompt = self.REVIEW_PROMPT + "\n\nCandidates:\n" + json.dumps(items, ensure_ascii=False, indent=2)
         try:
-            resp = self.llm_client.chat(
-                "你是安全审计专家。只输出JSON数组，不要其他内容。",
+            response = self.llm_client.chat(
+                "You are a security triage gate. Return only valid JSON.",
                 prompt,
                 timeout=45,
             )
         except Exception:
-            return [{"verdict": "confirmed", "reasoning": "LLM unavailable"}] * len(candidates)
+            return self._fail_closed(candidates, "llm_triage_exception")
 
-        if not resp.ok or not resp.content.strip():
-            return [{"verdict": "confirmed", "reasoning": "LLM error"}] * len(candidates)
+        if not getattr(response, "ok", False) or not str(getattr(response, "content", "") or "").strip():
+            return self._fail_closed(candidates, "llm_triage_error")
 
-        # Parse JSON array
-        text = resp.content.strip()
+        text = str(response.content).strip()
         try:
             result = json.loads(text)
         except json.JSONDecodeError:
             match = re.search(r"\[.*\]", text, re.S)
-            if match:
-                try:
-                    result = json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    return [{"verdict": "confirmed", "reasoning": "parse error"}] * len(candidates)
-            else:
-                return [{"verdict": "confirmed", "reasoning": "parse error"}] * len(candidates)
+            if not match:
+                return self._fail_closed(candidates, "llm_triage_parse_error")
+            try:
+                result = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return self._fail_closed(candidates, "llm_triage_parse_error")
 
         if isinstance(result, list) and len(result) == len(candidates):
-            return result
-        # Mismatch — accept all
-        return [{"verdict": "confirmed", "reasoning": "result mismatch"}] * len(candidates)
+            return [item if isinstance(item, dict) else {} for item in result]
+        return self._fail_closed(candidates, "llm_triage_result_mismatch")
+
+    def _apply_judgment(self, candidate: VulnerabilityCandidate, judgment: dict[str, Any]) -> None:
+        raw_verdict = str(judgment.get("verdict") or "").strip().lower()
+        verdict = {"confirmed": "accept", "rejected": "reject"}.get(raw_verdict, raw_verdict)
+        reason = str(judgment.get("reason") or judgment.get("reasoning") or "")
+        missing_context = coerce_str_list(judgment.get("missing_context"))[:8]
+        candidate.triage_verdict = verdict
+        candidate.triage_reason = reason
+        candidate.triage_missing_context = missing_context
+        candidate.triage_evidence_refs = coerce_str_list(judgment.get("evidence_refs"))[:8]
+
+        if verdict == "accept":
+            structural_reason = self._structural_rejection_reason(candidate)
+            if structural_reason:
+                candidate.triage_verdict = "needs_more_context"
+                self._mark_needs_more_context(candidate, structural_reason, [structural_reason])
+                return
+            candidate.confidence = min(0.95, candidate.confidence + 0.08)
+            return
+        if verdict == "reject":
+            candidate.mark_rejected(f"llm_rejected({reason[:120]})" if reason else "llm_rejected")
+            return
+        if verdict == "needs_more_context":
+            self._mark_needs_more_context(candidate, reason or "llm_needs_more_context", missing_context)
+            return
+        self._mark_needs_more_context(candidate, "llm_triage_invalid_verdict", ["invalid_verdict"])
+
+    def _structural_rejection_reason(self, candidate: VulnerabilityCandidate) -> str:
+        has_linked_flow = candidate.flow_status in {"direct", "propagated"}
+        if not candidate.source or not candidate.sink:
+            return "llm_accept_missing_source_or_sink"
+        if candidate.slice_status in {"sink_only", "unlinked_sink", "entry_reachable_no_taint"} and not self._has_tool_evidence(candidate):
+            return "llm_accept_without_tainted_flow"
+        if candidate.slice_status == "parameter_flow_unresolved" and not self._has_tool_evidence(candidate):
+            return "llm_accept_unresolved_parameter_flow"
+        if candidate.flow_status and not has_linked_flow and not self._has_tool_evidence(candidate):
+            return "llm_accept_unlinked_source_sink"
+        return ""
+
+    def _has_tool_evidence(self, candidate: VulnerabilityCandidate) -> bool:
+        return bool(candidate.evidence_refs and any(ref for ref in candidate.evidence_refs if ref != candidate.slice_id))
+
+    def _mark_needs_more_context(
+        self,
+        candidate: VulnerabilityCandidate,
+        reason: str,
+        missing_context: list[str] | None = None,
+    ) -> None:
+        candidate.triage_verdict = "needs_more_context"
+        candidate.triage_reason = reason
+        candidate.triage_missing_context = list(missing_context or [])
+        candidate.mark_needs_context(f"llm_needs_more_context({reason[:120]})")
+
+    def _fail_closed(self, candidates: list[VulnerabilityCandidate], reason: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "candidate_id": candidate.id,
+                "verdict": "needs_more_context",
+                "reason": reason,
+                "missing_context": [reason],
+            }
+            for candidate in candidates
+        ]
 
 
 class ClueAggregator:
@@ -1754,7 +2299,7 @@ class ClueAggregator:
         merged: dict[tuple, VulnerabilityCandidate] = {}
         trigger_counts: dict[tuple, int] = {}
         for candidate in candidates:
-            if not candidate.valid or candidate.validity != "valid":
+            if candidate.validity not in {"valid", "needs_context"}:
                 continue
             # Aggregate key varies by risk domain
             vt = (candidate.vulnerability_type or "").lower()
@@ -1775,6 +2320,16 @@ class ClueAggregator:
             current = merged.get(key)
             if current is None:
                 merged[key] = candidate
+                continue
+            if current.validity != "valid" and candidate.validity == "valid":
+                candidate.evidence.extend(item for item in current.evidence if item not in candidate.evidence)
+                candidate.trigger_conditions.extend(item for item in current.trigger_conditions if item not in candidate.trigger_conditions)
+                candidate.missing_checks.extend(item for item in current.missing_checks if item not in candidate.missing_checks)
+                candidate.assumptions.extend(item for item in current.assumptions if item not in candidate.assumptions)
+                candidate.evidence_refs.extend(item for item in current.evidence_refs if item not in candidate.evidence_refs)
+                candidate.confidence = min(0.95, max(current.confidence, candidate.confidence) + 0.04)
+                merged[key] = candidate
+                current = candidate
                 continue
             current.evidence.extend(item for item in candidate.evidence if item not in current.evidence)
             current.trigger_conditions.extend(item for item in candidate.trigger_conditions if item not in current.trigger_conditions)
@@ -1843,8 +2398,10 @@ class VulnerabilityClassifier:
     ) -> list[Finding]:
         slices_by_id = {item.id: item for item in slices}
         findings: list[Finding] = []
-        max_findings = budget.max_findings if budget else 80
-        for candidate in candidates[:max_findings]:
+        _ = budget
+        for candidate in candidates:
+            if not candidate.valid or candidate.validity != "valid":
+                continue
             program_slice = slices_by_id.get(candidate.slice_id)
             if not program_slice:
                 continue
@@ -1859,6 +2416,8 @@ class VulnerabilityClassifier:
             ).value
             vuln_type_enum = VulnType.from_string(vuln_type)
             risk_domain = risk_domain_for(vuln_type_enum).value
+            if risk_domain == "supply_chain_config":
+                continue
             cwe, owasp = self.TAXONOMY.get(vuln_type, ("", ""))
             score_breakdown = self._score(vuln_type, risk_domain, candidate, program_slice)
             total_score = sum(score_breakdown.values())
@@ -1874,6 +2433,7 @@ class VulnerabilityClassifier:
             should_verify = self._should_verify(vuln_type_enum, evidence_strength, total_score)
             summary = self._summary(candidate, program_slice, total_score, score_breakdown)
             graph = self._chain_graph(candidate, program_slice, vuln_type)
+            call_graph = self._call_graph(program_slice)
             findings.append(
                 Finding(
                     id=candidate.id,
@@ -1916,8 +2476,27 @@ class VulnerabilityClassifier:
                     tool_run_refs=list(program_slice.tool_run_refs),
                     artifact_refs=list(program_slice.artifact_refs),
                     chain_graph=graph,
+                    call_graph=call_graph,
+                    evidence_graph=program_slice.evidence_graph,
                     chinese_summary=summary,
                     risk_domain=risk_domain,
+                    signal_kind=program_slice.signal_kind or candidate.signal_kind,
+                    flow_status=program_slice.flow_status,
+                    slice_status=program_slice.slice_status,
+                    source_variables=list(program_slice.source_variables),
+                    sink_variables=list(program_slice.sink_variables),
+                    taint_path=list(program_slice.taint_path),
+                    flow_gaps=list(program_slice.flow_gaps),
+                    function_summary=dict(program_slice.function_summary),
+                    backward_slice=dict(program_slice.backward_slice),
+                    call_paths=[list(path) for path in program_slice.call_paths],
+                    entry_points=list(program_slice.entry_points),
+                    interprocedural_flow=dict(program_slice.interprocedural_flow),
+                    analysis_backends=list(program_slice.analysis_backends),
+                    triage_verdict=candidate.triage_verdict,
+                    triage_reason=candidate.triage_reason,
+                    triage_missing_context=list(candidate.triage_missing_context),
+                    triage_evidence_refs=list(candidate.triage_evidence_refs),
                     director_priority=candidate.director_priority,
                     director_reason=candidate.director_reason,
                     verification_hint=dict(candidate.verification_hint),
@@ -1973,7 +2552,7 @@ class VulnerabilityClassifier:
             source_control = 1
         elif program_slice.source:
             source_control = 3 if any(token in program_slice.source.lower() for token in ("request", "query", "body", "input", "argv", "recv")) else 2
-        reachability = 3 if len(program_slice.call_chain) >= 3 else (2 if program_slice.call_chain else 1)
+        reachability = self._reachability_score(program_slice)
         missing_guards = min(2, len(program_slice.missing_guards))
         tool_corroboration = min(2, len(program_slice.tool_run_refs))
         return {
@@ -1983,6 +2562,20 @@ class VulnerabilityClassifier:
             "missing_guards": missing_guards,
             "tool_corroboration": tool_corroboration,
         }
+
+    def _reachability_score(self, program_slice: ProgramSlice) -> int:
+        status = program_slice.slice_status or program_slice.evidence_graph.status
+        if status == "entry_tainted_flow":
+            return 3
+        if status == "local_tainted_flow":
+            return 2
+        if status in {"entry_parameter_flow", "entry_reachable_no_taint"}:
+            return 2
+        if status == "parameter_flow_unresolved":
+            return 1
+        if program_slice.call_chain:
+            return 1
+        return 0
 
     def _score_config(self, candidate: VulnerabilityCandidate) -> dict[str, int]:
         """Scoring formula for supply_chain_config / CI-CD findings."""
@@ -2090,6 +2683,8 @@ Source: {program_slice.source}
                     return None
             else:
                 return None
+        if not isinstance(result, dict):
+            return None
         severity = str(result.get("severity", "")).lower()
         if severity not in {"critical", "high", "medium", "low"}:
             return None
@@ -2233,6 +2828,88 @@ Source: {program_slice.source}
         connect(sink_id, effect_id, "triggers", "security impact")
         return ChainGraph(nodes=nodes, edges=edges)
 
+    def _call_graph(self, program_slice: ProgramSlice) -> ChainGraph:
+        nodes: list[ChainNode] = []
+        edges: list[ChainEdge] = []
+        seen: dict[tuple[str, str], str] = {}
+
+        def add_node(label: str, node_type: str, line: int | None = None, detail: str = "") -> str:
+            cleaned_label = (label or "").strip()
+            if not cleaned_label:
+                cleaned_label = node_type
+            key = (node_type, cleaned_label)
+            existing = seen.get(key)
+            if existing:
+                return existing
+            node_id = re.sub(r"[^a-zA-Z0-9_]+", "_", f"{node_type}_{cleaned_label}").strip("_")
+            if not node_id:
+                node_id = f"node_{len(nodes)}"
+            if any(node.id == node_id for node in nodes):
+                node_id = f"{node_id}_{len(nodes)}"
+            nodes.append(
+                ChainNode(
+                    id=node_id,
+                    label=cleaned_label,
+                    type=node_type,
+                    file_path=program_slice.file_path,
+                    line=line,
+                    detail=detail,
+                )
+            )
+            seen[key] = node_id
+            return node_id
+
+        def connect(source: str, target: str, label: str = "calls") -> None:
+            if source == target:
+                return
+            if any(edge.source == source and edge.target == target for edge in edges):
+                return
+            edges.append(ChainEdge(source=source, target=target, type="calls", label=label))
+
+        call_items = [item for item in program_slice.call_chain if item]
+        if program_slice.function_name and program_slice.function_name not in call_items:
+            call_items.append(program_slice.function_name)
+        path_items = [list(path) for path in program_slice.call_paths if path]
+        if not path_items and call_items:
+            path_items = [call_items]
+        previous = ""
+        for path in path_items[:24]:
+            previous = ""
+            for index, item in enumerate(path[:24]):
+                node_type = "entry" if index == 0 and self._looks_like_entry(item) else "function"
+                node_id = add_node(
+                    item,
+                    node_type,
+                    program_slice.line_start if item == program_slice.function_name else None,
+                    "connected function-call evidence",
+                )
+                if previous:
+                    connect(previous, node_id)
+                previous = node_id
+        if program_slice.sink and (not call_items or call_items[-1] != program_slice.sink):
+            sink_id = add_node(program_slice.sink, "sink", program_slice.line_start, "dangerous sink reached by this slice")
+            tail_nodes = []
+            if path_items:
+                tail_nodes = [path[-1] for path in path_items if path]
+            elif call_items:
+                tail_nodes = [call_items[-1]]
+            for tail in tail_nodes or [program_slice.function_name]:
+                if not tail:
+                    continue
+                tail_id = add_node(
+                    tail,
+                    "function",
+                    program_slice.line_start if tail == program_slice.function_name else None,
+                    "connected function-call evidence",
+                )
+                connect(tail_id, sink_id, "reaches sink")
+        return ChainGraph(nodes=nodes, edges=edges)
+
+    @staticmethod
+    def _looks_like_entry(label: str) -> bool:
+        normalized = label.strip().upper()
+        return normalized.startswith(("GET ", "POST ", "PUT ", "PATCH ", "DELETE ", "ANY ")) or normalized.startswith("/")
+
     def _effect_for(self, vuln_type: str, program_slice: ProgramSlice) -> tuple[str, str]:
         mapping = {
             "sql_injection": ("SQL impact", "Potential unauthorized query manipulation or data exposure."),
@@ -2260,6 +2937,15 @@ Source: {program_slice.source}
         return label, detail
 
     def _reachability(self, program_slice: ProgramSlice) -> str:
+        status = program_slice.slice_status or program_slice.evidence_graph.status
+        if status == "entry_tainted_flow":
+            return "reachable"
+        if status == "local_tainted_flow":
+            return "source_identified"
+        if status in {"entry_parameter_flow", "entry_reachable_no_taint"}:
+            return "likely_reachable"
+        if status == "parameter_flow_unresolved":
+            return "parameter_source_unresolved"
         if program_slice.source and program_slice.call_chain:
             return "likely_reachable"
         if program_slice.source:
@@ -2347,7 +3033,9 @@ class VulnerabilityMiningAgent:
         self.llm_client = llm_client
         self.event_sink = event_sink
         self.locator = DangerousFunctionLocator()
+        self.signal_router = SignalRouter()
         self.slice_analyzer = SliceAnalyzer()
+        self.codeql_analyzer = CodeQLAnalyzer(getattr(self.tool_runner, "settings", None))
         self.candidate_generator = CandidateGenerator(llm_client=llm_client)
         self.aggregator = ClueAggregator()
         self.classifier = VulnerabilityClassifier(llm_client=llm_client)
@@ -2394,8 +3082,13 @@ class VulnerabilityMiningAgent:
         final_tool_order = [item.name for item in recommendations]
 
         self._emit_step_start("tooling", "security tools selected", {"project_type": profile.project_type})
-        invocations = self.tool_planner.build_invocations(recommendations, target)
+        codeql_recommended = any(item.name == "codeql" for item in recommendations)
+        tool_recommendations = [item for item in recommendations if item.name != "codeql"]
+        invocations = self.tool_planner.build_invocations(tool_recommendations, target)
         result.tool_results = run_invocations_parallel(invocations, self.tool_runner)
+        if codeql_recommended or getattr(getattr(self.tool_runner, "settings", None), "enable_codeql", True):
+            codeql_result, _codeql_evidence = self.codeql_analyzer.run(target, profile)
+            result.tool_results.append(codeql_result)
         self._emit_step_done(
             "tooling",
             "security tools completed",
@@ -2404,6 +3097,8 @@ class VulnerabilityMiningAgent:
 
         self._emit_step_start("dangerous_function_location", "locating dangerous anchors", {})
         result.dangerous_functions = self.locator.locate(target, result.tool_results, budget, strategy)
+        streams = self.signal_router.route(result.dangerous_functions)
+        result.signal_counts = streams.counts()
         usage.anchors = len(result.dangerous_functions)
         usage.anchors_before_budget = usage.anchors + sum(self.locator.last_suppressed_counts.values())
         usage.config_anchors_suppressed = self.locator.last_suppressed_counts.get("config", 0)
@@ -2419,14 +3114,20 @@ class VulnerabilityMiningAgent:
         )
 
         self._emit_step_start("slicing", "building structured slices", {"dangerous_functions": len(result.dangerous_functions)})
-        result.program_slices = self.slice_analyzer.analyze(
-            target, result.dangerous_functions, semantic_index, self.llm_client, budget, strategy
+        source_slices = self.slice_analyzer.analyze(
+            target, streams.source_code, semantic_index, self.llm_client, budget, strategy
         )
+        static_slices = self.slice_analyzer.build_static_slices(
+            streams.static_evidence,
+        )
+        result.program_slices = [*source_slices, *static_slices]
         usage.slices = len(result.program_slices)
         self._emit_step_done("slicing", "structured slices ready", {"program_slices": len(result.program_slices)})
 
         self._emit_step_start("candidate_generation", "generating candidates in batches", {"program_slices": len(result.program_slices)})
-        result.candidates = self.candidate_generator.generate(result.program_slices, self.llm_client, budget)
+        source_candidates = self.candidate_generator.generate(source_slices, self.llm_client, budget)
+        static_candidates = self.candidate_generator.generate_static(static_slices)
+        result.candidates = [*source_candidates, *static_candidates]
         usage.candidates = len(result.candidates)
         usage.llm_calls = self.candidate_generator.llm_calls_used
         self._emit_step_done(
@@ -2461,6 +3162,7 @@ class VulnerabilityMiningAgent:
             "candidate_top_before": candidate_top_before,
             "candidate_top_after": candidate_top_after,
             "verification_queue_top_ids": [item.id for item in result.findings if item.should_verify][:10],
+            "signal_counts": result.signal_counts,
         }
         self._emit_step_done("vulnerability_classification", "findings classified", {"findings": len(result.findings)})
 

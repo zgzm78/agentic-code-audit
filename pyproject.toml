@@ -25,6 +25,7 @@ mcp = [
 agentic-code-audit = "agentic_code_audit.cli:main"
 agentic-code-audit-web = "agentic_code_audit.server:main"
 agentic-code-audit-backend = "agentic_code_audit.server:main"
+agentic-code-audit-quality = "agentic_code_audit.report_quality:main"
 
 [build-system]
 requires = ["hatchling"]

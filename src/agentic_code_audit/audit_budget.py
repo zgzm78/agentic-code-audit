@@ -24,6 +24,13 @@ class AuditMode(str, Enum):
 
 @dataclass(frozen=True)
 class AuditBudget:
+    """Mode budget.
+
+    max_anchors, max_slices, max_candidates and max_findings are legacy API
+    fields. A value of 0 means mining evidence collection and final finding
+    output are unbounded; LLM and dynamic-verification budgets still apply.
+    """
+
     mode: str
     max_anchors: int
     max_slices: int
@@ -40,10 +47,10 @@ class AuditBudget:
         if mode == AuditMode.QUICK:
             return cls(
                 mode=mode.value,
-                max_anchors=300,
-                max_slices=40,
-                max_candidates=40,
-                max_findings=10,
+                max_anchors=0,
+                max_slices=0,
+                max_candidates=0,
+                max_findings=0,
                 max_llm_calls=8,
                 enable_config_audit=False,
                 weak_signal_min_confidence=0.55,
@@ -52,23 +59,23 @@ class AuditBudget:
         if mode == AuditMode.DEEP:
             return cls(
                 mode=mode.value,
-                max_anchors=2500,
-                max_slices=200,
-                max_candidates=200,
-                max_findings=50,
+                max_anchors=0,
+                max_slices=0,
+                max_candidates=0,
+                max_findings=0,
                 max_llm_calls=60,
-                enable_config_audit=True,
+                enable_config_audit=False,
                 weak_signal_min_confidence=0.35,
                 max_dynamic_verifications=10,
             )
         return cls(
             mode=AuditMode.STANDARD.value,
-            max_anchors=800,
-            max_slices=80,
-            max_candidates=80,
-            max_findings=20,
+            max_anchors=0,
+            max_slices=0,
+            max_candidates=0,
+            max_findings=0,
             max_llm_calls=20,
-            enable_config_audit=True,
+            enable_config_audit=False,
             weak_signal_min_confidence=0.45,
             max_dynamic_verifications=5,
         )
@@ -88,7 +95,7 @@ class BudgetUsage:
     aggregated_candidates: int = 0
     findings: int = 0
     llm_calls: int = 0
-    config_audit_enabled: bool = True
+    config_audit_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

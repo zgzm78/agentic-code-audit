@@ -4,7 +4,6 @@ import os
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 
 def _load_dotenv(path: Path) -> dict[str, str]:
@@ -83,6 +82,9 @@ class Settings:
     sandbox_container: str = "agentic-code-audit-sandbox"
     sandbox_image: str = "agentic-code-audit-sandbox:local"
     build_network_enabled: bool = False
+    enable_codeql: bool = True
+    codeql_timeout: int = 600
+    codeql_pack_download: bool = True
 
     @property
     def deepseek_api_key(self) -> str:
@@ -135,4 +137,7 @@ class Settings:
             sandbox_container=value("AUDIT_SANDBOX_CONTAINER", "agentic-code-audit-sandbox"),
             sandbox_image=value("AUDIT_SANDBOX_IMAGE", "agentic-code-audit-sandbox:local"),
             build_network_enabled=bool_value("AUDIT_BUILD_NETWORK_ENABLED", False),
+            enable_codeql=bool_value("AUDIT_ENABLE_CODEQL", True),
+            codeql_timeout=int_value("AUDIT_CODEQL_TIMEOUT", 600),
+            codeql_pack_download=bool_value("AUDIT_CODEQL_PACK_DOWNLOAD", True),
         )

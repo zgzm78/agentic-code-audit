@@ -8,6 +8,7 @@ from typing import Any
 
 from ..config import Settings
 from ..models import ProjectProfile, normalize_path
+from ..path_policy import PathPolicy
 
 
 LANGUAGE_EXTENSIONS = {
@@ -29,23 +30,6 @@ LANGUAGE_EXTENSIONS = {
     ".hpp": "C/C++ Header",
     ".rs": "Rust",
     ".sql": "SQL",
-}
-
-IGNORED_DIRS = {
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "venv",
-    "env",
-    "node_modules",
-    "dist",
-    "build",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    "vendor",
 }
 
 PACKAGE_FILES = {
@@ -152,6 +136,7 @@ ENTRY_KEYWORDS = (
 class ProjectProfiler:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.path_policy = PathPolicy()
 
     def profile(self, root: Path) -> ProjectProfile:
         root = root.resolve()
@@ -250,10 +235,8 @@ class ProjectProfiler:
 
     def _iter_files(self, root: Path):
         for path in root.rglob("*"):
-            rel_parts = path.relative_to(root).parts if path != root else ()
-            if any(part in IGNORED_DIRS for part in rel_parts):
-                continue
-            if path.is_file():
+            rel = normalize_path(path, root)
+            if path.is_file() and self.path_policy.include_inventory(rel):
                 yield path
 
     def _build_entries(self, path: Path, root: Path) -> list[dict[str, Any]]:

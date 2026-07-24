@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ..config import Settings
 from ..models import Finding, normalize_path
-from ..agents.profiler import IGNORED_DIRS
+from ..path_policy import PathPolicy
 
 
 @dataclass(frozen=True)
@@ -90,6 +90,7 @@ SOURCE_HINT = re.compile(r"(request|req\.|args|query|param|input|form|GET|POST)"
 class BuiltinPatternScanner:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.path_policy = PathPolicy()
 
     def scan(self, root: Path) -> list[Finding]:
         root = root.resolve()
@@ -98,7 +99,7 @@ class BuiltinPatternScanner:
         for path in root.rglob("*"):
             if scanned >= self.settings.max_files:
                 break
-            if any(part in IGNORED_DIRS for part in path.parts) or not path.is_file():
+            if not path.is_file() or self.path_policy.classify(normalize_path(path, root)).action == "exclude":
                 continue
             try:
                 if path.stat().st_size > self.settings.max_file_size:

@@ -47,6 +47,13 @@ export default function FindingDetail({ finding }: Props) {
         <ChainGraphView graph={finding.chain_graph} />
       </div>
 
+      {(finding.call_graph?.nodes?.length || 0) > 0 && (
+        <div className="finding-section chain-section">
+          <h4>函数调用连通图</h4>
+          <ChainGraphView graph={finding.call_graph} />
+        </div>
+      )}
+
       {(finding.trigger_conditions || []).length > 0 && (
         <div className="finding-section">
           <h4>触发条件</h4>

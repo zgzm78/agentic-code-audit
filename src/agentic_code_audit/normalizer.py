@@ -8,7 +8,6 @@ never used as the final vulnerability_type.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Any
 
 from .vulnerability_types import VulnType

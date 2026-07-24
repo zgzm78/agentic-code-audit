@@ -11,7 +11,10 @@ export default function FindingsWorkspace({ data, actions }: { data: AuditData; 
   const [severity, setSeverity] = useState("all");
   const [selected, setSelected] = useState<Finding | null>(null);
   const [nodeDetail, setNodeDetail] = useState<any>(null);
+  const [graphMode, setGraphMode] = useState<"evidence" | "calls">("evidence");
   const filtered = useMemo(() => data.findings.filter((f) => (severity === "all" || f.severity === severity) && (!query || `${f.title} ${f.cwe} ${f.file_path}`.toLowerCase().includes(query.toLowerCase()))), [data.findings, query, severity]);
+  const activeGraph = graphMode === "calls" ? selected?.call_graph : selected?.chain_graph;
+  const activeGraphTitle = graphMode === "calls" ? "函数调用连通图" : "攻击证据链";
 
   useEffect(() => {
     const id = params.get("finding");
@@ -30,8 +33,8 @@ export default function FindingsWorkspace({ data, actions }: { data: AuditData; 
 
     <main className="investigation-stage">
       <div className="investigation-head">{selected ? <><div><span className={`severity-pill ${selected.severity}`}>{selected.severity}</span><span>{selected.vulnerability_type}</span><span>{selected.cwe || "CWE 未映射"}</span></div><h2>{selected.title}</h2><p>{selected.chinese_summary || selected.description}</p></> : <><div><span>未选择发现</span></div><h2>选择一个漏洞开始调查</h2></>}</div>
-      <div className="graph-toolbar"><div><GitBranch size={15} /><strong>攻击证据链</strong><span>{selected?.chain_graph?.nodes?.length || 0} 节点</span></div><div className="graph-legend"><span><i className="source" />Source</span><span><i className="path" />Path</span><span><i className="sink" />Sink</span></div></div>
-      <EvidenceGraph graph={selected?.chain_graph} onNodeSelect={setNodeDetail} />
+      <div className="graph-toolbar"><div><GitBranch size={15} /><strong>{activeGraphTitle}</strong><span>{activeGraph?.nodes?.length || 0} 节点</span></div><div className="graph-switch"><button className={graphMode === "evidence" ? "active" : ""} onClick={() => { setGraphMode("evidence"); setNodeDetail(null); }}>证据链</button><button className={graphMode === "calls" ? "active" : ""} onClick={() => { setGraphMode("calls"); setNodeDetail(null); }}>调用图</button></div><div className="graph-legend"><span><i className="source" />Source</span><span><i className="path" />Path</span><span><i className="sink" />Sink</span></div></div>
+      <EvidenceGraph graph={activeGraph} onNodeSelect={setNodeDetail} />
       {nodeDetail && <div className="node-inspector"><button onClick={() => setNodeDetail(null)}>×</button><small>{nodeDetail.type}</small><strong>{nodeDetail.label}</strong><span>{nodeDetail.file_path}:{nodeDetail.line || ""}</span><p>{nodeDetail.detail || "该节点参与当前漏洞的攻击路径。"}</p></div>}
     </main>
 

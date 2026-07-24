@@ -664,12 +664,12 @@ Final Answer: {"focus_directories": [...], "priority_functions": [...], "confirm
                 ))
 
         # Simple list fields
-        for field in ("focus_directories", "skip_patterns", "priority_functions",
-                       "parser_entries", "taint_sources", "focus_subsystems",
-                       "harness_candidates", "dynamic_priority_functions"):
-            value = raw.get(field)
+        for field_name in ("focus_directories", "skip_patterns", "priority_functions",
+                           "parser_entries", "taint_sources", "focus_subsystems",
+                           "harness_candidates", "dynamic_priority_functions"):
+            value = raw.get(field_name)
             if isinstance(value, list):
-                setattr(strategy, field, [str(v) for v in value[:8]])
+                setattr(strategy, field_name, [str(v) for v in value[:8]])
 
         # Scalar fields
         strategy.build_attempt = bool(raw.get("build_attempt", False))
@@ -1079,10 +1079,10 @@ Final Answer: {"focus_directories": [...], "priority_functions": [...], "confirm
         # Dismissed noise
         strategy.dismissed_noise = self._dict_list(raw.get("dismissed_noise"), limit=12)
         strategy.confirmed_high_risk = self._dict_list(raw.get("confirmed_high_risk"), limit=12)
-        for field in ("parser_entries", "taint_sources", "harness_candidates", "dynamic_priority_functions"):
-            value = raw.get(field)
+        for field_name in ("parser_entries", "taint_sources", "harness_candidates", "dynamic_priority_functions"):
+            value = raw.get(field_name)
             if isinstance(value, list):
-                setattr(strategy, field, [str(v) for v in value[:8]])
+                setattr(strategy, field_name, [str(v) for v in value[:8]])
         hints = raw.get("verification_hints")
         if isinstance(hints, dict):
             strategy.verification_hints = {

@@ -146,10 +146,10 @@ class ToolRegistry:
     def recommend_for_project(self, target: Path) -> list[ToolDefinition]:
         return [self._tools[name] for name in self._project_tool_names(target) if name in self._tools]
 
-    def availability(self, env: dict[str, str]) -> list[ToolAvailability]:
-        return [self.check_tool(tool.name, env) for tool in self.all()]
+    def availability(self, env: dict[str, str], *, read_version: bool = True) -> list[ToolAvailability]:
+        return [self.check_tool(tool.name, env, read_version=read_version) for tool in self.all()]
 
-    def check_tool(self, name: str, env: dict[str, str]) -> ToolAvailability:
+    def check_tool(self, name: str, env: dict[str, str], *, read_version: bool = True) -> ToolAvailability:
         definition = self.get(name)
         executable = shutil.which(definition.executable, path=env.get("PATH"))
         if not executable:
@@ -161,7 +161,7 @@ class ToolRegistry:
                 capability=definition.capability,
                 reason=f"{definition.executable} is not installed or not in PATH.",
             )
-        version = self._read_version([executable, *definition.version_args], env)
+        version = self._read_version([executable, *definition.version_args], env) if read_version else ""
         return ToolAvailability(
             name=definition.name,
             executable=definition.executable,
@@ -430,7 +430,13 @@ class ToolPlanner:
     ) -> list[ToolRecommendation]:
         target = target.resolve()
         definitions = self._recommend_definitions(agent, phase, profile, target)
-        availability = {item.name: item for item in self.list_available_tools(profile)}
+        if self.availability_provider:
+            availability = {item.name: item for item in self.list_available_tools(profile)}
+        else:
+            availability = {
+                definition.name: self.registry.check_tool(definition.name, self.env, read_version=False)
+                for definition in definitions
+            }
         recommendations: list[ToolRecommendation] = []
         for definition in definitions:
             item = availability.get(definition.name) or ToolAvailability(
@@ -832,13 +838,23 @@ class ToolRunner:
         self.cache = cache or ToolCache(app_root / "data" / "tool-cache")
         self.artifacts = artifacts or ArtifactManager(app_root / "reports" / "tool-artifacts")
 
-    def list_tools(self) -> list[ToolAvailability]:
-        return [self.check_tool(tool.name) for tool in self.registry.all()]
+    def list_tools(self, *, read_version: bool = False) -> list[ToolAvailability]:
+        sandbox_available = self._sandbox_available() if self.sandbox_container else False
+        return [
+            self.check_tool(tool.name, read_version=read_version, sandbox_available=sandbox_available)
+            for tool in self.registry.all()
+        ]
 
-    def check_tool(self, name: str) -> ToolAvailability:
+    def check_tool(
+        self,
+        name: str,
+        *,
+        read_version: bool = True,
+        sandbox_available: bool | None = None,
+    ) -> ToolAvailability:
         if name in SANDBOX_TOOLS:
-            return self._check_sandbox_tool(name)
-        availability = self.registry.check_tool(name, self.env)
+            return self._check_sandbox_tool(name, read_version=read_version, sandbox_available=sandbox_available)
+        availability = self.registry.check_tool(name, self.env, read_version=read_version)
         availability.execution_location = "backend"
         availability.network_policy = "backend_default"
         return availability
@@ -863,10 +879,17 @@ class ToolRunner:
         except (OSError, subprocess.TimeoutExpired):
             return False
 
-    def _check_sandbox_tool(self, tool: str) -> ToolAvailability:
+    def _check_sandbox_tool(
+        self,
+        tool: str,
+        *,
+        read_version: bool = True,
+        sandbox_available: bool | None = None,
+    ) -> ToolAvailability:
         """Check whether *tool* is available inside the sandbox container."""
         definition = self.registry.get(tool)
-        if not self._sandbox_available():
+        reachable = self._sandbox_available() if sandbox_available is None else sandbox_available
+        if not reachable:
             return ToolAvailability(
                 name=definition.name,
                 executable=definition.executable,
@@ -911,18 +934,20 @@ class ToolRunner:
                 network_policy="none",
             )
         sandbox_path = proc.stdout.strip()
-        try:
-            version_proc = subprocess.run(
-                ["docker", "exec", self.sandbox_container, sandbox_path, "--version"],
-                text=True,
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-            version_line = (version_proc.stdout or version_proc.stderr).strip().splitlines()
-            version = version_line[0][:200] if version_line else ""
-        except (OSError, subprocess.TimeoutExpired):
-            version = ""
+        version = ""
+        if read_version:
+            try:
+                version_proc = subprocess.run(
+                    ["docker", "exec", self.sandbox_container, sandbox_path, "--version"],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                version_line = (version_proc.stdout or version_proc.stderr).strip().splitlines()
+                version = version_line[0][:200] if version_line else ""
+            except (OSError, subprocess.TimeoutExpired):
+                version = ""
         return ToolAvailability(
             name=definition.name,
             executable=definition.executable,

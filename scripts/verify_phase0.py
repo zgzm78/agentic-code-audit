@@ -62,7 +62,7 @@ def main() -> int:
     print(f"\n[1] Checking sandbox container '{SANDBOX_CONTAINER}' ...")
     if not check_sandbox_running():
         print(f"    [FAIL]  Sandbox container '{SANDBOX_CONTAINER}' is NOT running.")
-        print(f"    ->  Run: docker compose up --build")
+        print("    ->  Run: docker compose up --build")
         return 1
     print("    [OK]  Sandbox container is running.")
 
@@ -120,9 +120,9 @@ int main(int argc, char **argv) {
         ]
         ccode, cout, cerr = run(cppcheck_cmd, timeout=30)
         if ccode == 0 and ("strcpy" in cout or "bufferAccess" in cout or "unsafe" in cout.lower()):
-            print(f"    [OK]   cppcheck detected issues in test file -> sandbox routing works!")
+            print("    [OK]   cppcheck detected issues in test file -> sandbox routing works!")
         elif ccode == 0:
-            print(f"    [WARN]  cppcheck ran but output doesn't mention expected patterns.")
+            print("    [WARN]  cppcheck ran but output doesn't mention expected patterns.")
             print(f"       stdout preview: {(cout or cerr)[:200]}")
         else:
             print(f"    [FAIL]  cppcheck failed (exit={ccode}): {(cout or cerr)[:300]}")
@@ -135,7 +135,7 @@ int main(int argc, char **argv) {
     ]
     tcode, tout, terr = run(ctags_cmd, timeout=10)
     if tcode == 0 and ("unsafe_copy" in tout or "main" in tout):
-        print(f"    [OK]   ctags extracted function boundaries -> sandbox routing works!")
+        print("    [OK]   ctags extracted function boundaries -> sandbox routing works!")
     elif tcode == 0:
         print(f"    [WARN]  ctags ran but output unexpected: {tout[:200]}")
     else:
@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
     print(f"\n{'=' * 64}")
     print(f"Summary: {ok_count}/{len(SANDBOX_TOOLS)} tools available in sandbox, {miss_count} missing")
     if miss_count > 0:
-        print(f"Missing tools are expected if not installed in sandbox Dockerfile.")
+        print("Missing tools are expected if not installed in sandbox Dockerfile.")
     print(f"{'=' * 64}")
 
     return 0 if miss_count <= 4 else 1

@@ -26,6 +26,7 @@ export default function MiningDebugPanel({ task, debug }: Props) {
   const aggregationInput = Number(debug.aggregation_input_count || 0);
   const aggregationOutput = Number(debug.aggregation_output_count || 0);
   const queueCount = Number(debug.verification_queue_count || 0);
+  const investigationCandidates = debug.investigation_candidates || [];
 
   return (
     <div className="debug-panel">
@@ -40,6 +41,7 @@ export default function MiningDebugPanel({ task, debug }: Props) {
         <Metric label="Slices" value={sumRecord(debug.slice_count_by_language)} />
         <Metric label="Candidates" value={Number(candidateValidity.total || 0)} />
         <Metric label="有效 / 无效" value={`${candidateValidity.valid || 0} / ${candidateValidity.invalid || 0}`} />
+        <Metric label="待调查候选" value={investigationCandidates.length} />
         <Metric label="聚合输入 -> 输出" value={`${aggregationInput} -> ${aggregationOutput}`} />
         <Metric label="验证队列" value={queueCount} />
       </div>
@@ -52,6 +54,31 @@ export default function MiningDebugPanel({ task, debug }: Props) {
         <CountBlock title="Findings by type" values={debug.finding_count_by_type} />
         <CountBlock title="无效 candidate 原因" values={debug.invalid_candidate_reasons} />
       </div>
+
+      {investigationCandidates.length > 0 && (
+        <section className="debug-candidate-block">
+          <div>
+            <h4>高价值待确认线索</h4>
+            <p>这些候选缺少关键上下文或需要进一步验证，不会进入最终漏洞报告。</p>
+          </div>
+          <div className="debug-candidate-list">
+            {investigationCandidates.slice(0, 20).map((candidate, index) => (
+              <div className="debug-candidate-row" key={asText(candidate.id, String(index))}>
+                <div>
+                  <strong>{asText(candidate.title, asText(candidate.vulnerability_type, "candidate"))}</strong>
+                  <span>
+                    {asText(candidate.file_path, "")}:{asText(candidate.line_start, "-")} ·{" "}
+                    {asText(candidate.function_name, "unknown")}
+                  </span>
+                </div>
+                <small>Source: {asText(candidate.source, "unknown")}</small>
+                <small>Sink: {asText(candidate.sink, "unknown")}</small>
+                <em>{asText(candidate.triage_reason, asText(candidate.validity, "needs_context"))}</em>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       <ObjectDetails title="Budget" value={debug.budget} />
       <ObjectDetails title="Budget usage" value={debug.budget_usage} />
@@ -106,4 +133,9 @@ function ObjectDetails({ title, value }: { title: string; value?: unknown }) {
 
 function sumRecord(values?: Record<string, number>): number {
   return Object.values(values || {}).reduce((total, value) => total + Number(value || 0), 0);
+}
+
+function asText(value: unknown, fallback: string): string {
+  if (value === null || value === undefined || value === "") return fallback;
+  return String(value);
 }
